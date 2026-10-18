@@ -232,7 +232,7 @@ ensure_xray() {
         rm -f "$installer"
         die "Xray 官方安装脚本下载失败，请检查网络"
     fi
-    bash "$installer" @ install || rc=$?
+    bash "$installer" install || rc=$?
     rm -f "$installer"
     (( rc == 0 )) || die "Xray 安装失败（退出码 ${rc}）"
     [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
