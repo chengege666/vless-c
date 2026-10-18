@@ -18,7 +18,8 @@ readonly LOG_DIR="/var/log/xray"
 readonly ACME_HOME="/root/.acme.sh"
 readonly ACME_BIN="${ACME_HOME}/acme.sh"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-readonly LISTEN_PORT="443"
+# Cloudflare 支持的 HTTPS 端口（回源提示用）
+readonly CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 readonly DEFAULT_NODE_NAME="cgg-vless-ws"
 
 # ------------------------------ 颜色定义 --------------------------------------
@@ -45,6 +46,7 @@ UUID=""
 WS_PATH=""
 NODE_NAME="${DEFAULT_NODE_NAME}"
 CERT_SOURCE="auto"
+LISTEN_PORT="443"
 SERVER_IP=""
 RUN_USER="nobody"
 RUN_GROUP="nogroup"
@@ -218,6 +220,53 @@ ask_cert_source() {
     log "证书来源：${CERT_SOURCE}"
 }
 
+# ------------------------------ 监听端口 --------------------------------------
+# 默认 443；NAT VPS 可选择服务商分配端口范围内的自定义端口
+ask_listen_port() {
+    [[ -t 0 ]] || { log "非交互模式：使用默认监听端口 ${LISTEN_PORT}"; return 0; }
+
+    local choice input
+    printf '\n选择监听端口模式：\n'
+    printf '  1) 默认 443（普通 VPS 推荐）\n'
+    printf '  2) 自定义端口（NAT VPS 受限端口范围）\n'
+    read -r -p "请选择 [1-2]（回车默认 1）：" choice || return 0
+    case "${choice:-1}" in
+        1)
+            log "监听端口：${LISTEN_PORT}"
+            ;;
+        2)
+            read -r -p "请输入监听端口（1-65535）：" input || return 0
+            input="${input//[[:space:]]/}"
+            if [[ -z "$input" ]]; then
+                warn "输入为空，使用默认端口 443"
+                return 0
+            fi
+            if [[ ! "$input" =~ ^[0-9]+$ ]] || (( 10#$input < 1 || 10#$input > 65535 )); then
+                die "端口不合法：${input}"
+            fi
+            if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${input}" 2>/dev/null | grep -q .; then
+                die "端口 ${input} 已被占用，请更换"
+            fi
+            LISTEN_PORT="$input"
+            log "监听端口：${LISTEN_PORT}"
+            printf '%s-------- NAT VPS 端口回源提示 --------%s\n' "$C_YELLOW" "$C_RESET"
+            printf '  1) 端口必须在服务商分配的端口范围内，且已在服务商处完成端口映射\n'
+            printf '  2) Cloudflare 支持的 HTTPS 端口：%s\n' "$CF_HTTPS_PORTS"
+            if [[ " $CF_HTTPS_PORTS " == *" ${LISTEN_PORT} "* ]]; then
+                printf '  3) 监听端口 %s 在 Cloudflare 支持列表内，客户端端口填 %s 即可回源\n' "$LISTEN_PORT" "$LISTEN_PORT"
+            else
+                printf '  3) 监听端口 %s 不在 Cloudflare 支持列表，需在 Cloudflare Origin Rules\n' "$LISTEN_PORT"
+                printf '     将回源端口设为 %s，客户端端口填 443\n' "$LISTEN_PORT"
+            fi
+            printf '  4) 80 端口不可用申请证书时，改用 DNS-01 验证（总菜单 8 → 3）\n'
+            printf '%s----------------------------------------%s\n' "$C_YELLOW" "$C_RESET"
+            ;;
+        *)
+            warn "无效选项，使用默认 443"
+            ;;
+    esac
+}
+
 # ------------------------------ 端口占用 --------------------------------------
 free_port_80() {
     local holders=""
@@ -313,7 +362,7 @@ issue_cert() {
             err "DNS 查询失败（NXDOMAIN）：域名未解析或记录尚未生效"
         elif grep -qE 'Connection refused|Timeout|timed out' "$log_file" 2>/dev/null; then
             err "80 端口公网不可达：请检查安全组、NAT 端口映射与防火墙"
-            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 9 → 3）"
+            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 8 → 3）"
         elif grep -q 'Invalid response' "$log_file" 2>/dev/null; then
             err "80 端口被其他服务占用或响应异常"
         fi
@@ -377,8 +426,10 @@ use_cert_files() {
     local cert key
     [[ -t 0 ]] || die "使用自有证书时需要在交互终端输入路径"
 
-    read -r -p "证书链文件路径（fullchain.pem）：" cert || return 1
-    read -r -p "私钥文件路径（privkey.pem）：" key || return 1
+    printf '%s提示：acme.sh 申请的证书默认在 /root/.acme.sh/<域名>_ecc/ 目录，%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s内含 <域名>.cer、fullchain.cer、<域名>.key 等文件，扩展名不影响导入。%s\n' "$C_CYAN" "$C_RESET"
+    read -r -p "证书文件路径（.cer，如 /root/.acme.sh/xxx.xyz_ecc/fullchain.cer）：" cert || return 1
+    read -r -p "私钥文件路径（.key，如 /root/.acme.sh/xxx.xyz_ecc/xxx.xyz.key）：" key || return 1
     cert="${cert/#\~/$HOME}"
     key="${key/#\~/$HOME}"
 
@@ -405,7 +456,7 @@ use_cert_files() {
 use_installed_cert() {
     local cert="${CERT_DIR}/fullchain.pem" key="${CERT_DIR}/privkey.pem"
     [[ -s "$cert" && -s "$key" ]] \
-        || die "未找到已安装证书，请先在总菜单 9 中申请并安装到 ${CERT_DIR}"
+        || die "未找到已安装证书，请先在总菜单 8 中申请并安装到 ${CERT_DIR}"
     cert_is_valid "$cert" "$key" || die "已安装的证书与私钥不匹配，请重新安装证书"
     fix_cert_perms
     log "使用已安装证书：${CERT_DIR}"
@@ -618,7 +669,7 @@ configure_firewall() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "${LISTEN_PORT}/tcp" >/dev/null 2>&1 || warn "UFW 放行 ${LISTEN_PORT}/tcp 失败"
         ufw allow 80/tcp >/dev/null 2>&1 || warn "UFW 放行 80/tcp 失败"
-        log "UFW 已放行 443/tcp 与 80/tcp"
+        log "UFW 已放行 ${LISTEN_PORT}/tcp 与 80/tcp"
         return 0
     fi
 
@@ -630,11 +681,11 @@ configure_firewall() {
                     || warn "iptables 放行 ${p}/tcp 失败，请手动放行"
             fi
         done
-        log "iptables 已放行 443/tcp 与 80/tcp（如使用 firewalld 请另行放行）"
+        log "iptables 已放行 ${LISTEN_PORT}/tcp 与 80/tcp（如使用 firewalld 请另行放行）"
         return 0
     fi
 
-    warn "未检测到 UFW / iptables，请手动放行 443/tcp 与 80/tcp"
+    warn "未检测到 UFW / iptables，请手动放行 ${LISTEN_PORT}/tcp 与 80/tcp"
 }
 
 # ------------------------------ 公网 IP ---------------------------------------
@@ -680,7 +731,20 @@ print_result() {
     printf '  证书路径    : %s\n' "$CERT_DIR"
     printf '%s========================================================%s\n\n' "$C_CYAN" "$C_RESET"
     printf '%sCloudflare CDN：请将域名代理（橙色云）开启，SSL/TLS 模式选择 Full (strict)，%s\n' "$C_YELLOW" "$C_RESET"
-    printf '%s客户端地址可改为优选 IP/域名，端口填 443 或 2053/2083/2087/2096。%s\n\n' "$C_YELLOW" "$C_RESET"
+    printf '%s客户端地址可改为优选 IP/域名，端口填 443 或 2053/2083/2087/2096。%s\n' "$C_YELLOW" "$C_RESET"
+
+    # NAT 自定义端口时的回源提示
+    if [[ "$LISTEN_PORT" != "443" ]]; then
+        if [[ " $CF_HTTPS_PORTS " == *" ${LISTEN_PORT} "* ]]; then
+            printf '%sNAT 回源：服务端监听 %s 为 Cloudflare 支持端口，客户端端口填 %s 即可回源。%s\n' \
+                "$C_YELLOW" "$LISTEN_PORT" "$LISTEN_PORT" "$C_RESET"
+        else
+            printf '%sNAT 回源：服务端监听 %s，需在 Cloudflare Origin Rules 将回源端口设为 %s，%s\n' \
+                "$C_YELLOW" "$LISTEN_PORT" "$LISTEN_PORT" "$C_RESET"
+            printf '%s客户端端口填 443（或 2053/2083/2087/2096/8443）。%s\n' "$C_YELLOW" "$C_RESET"
+        fi
+    fi
+    printf '\n'
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
 
@@ -713,6 +777,7 @@ main() {
     ask_email
     ask_node_name
     ask_cert_source
+    ask_listen_port
 
     # 仅自动申请时才需要占用 80 端口
     if [[ "$CERT_SOURCE" == "auto" ]]; then
