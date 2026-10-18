@@ -256,8 +256,13 @@ gen_short_id() {
 # ------------------------------ 配置写入 --------------------------------------
 write_config() {
     install -d -m 755 -o root -g root "$CONFIG_DIR"
-    install -d -m 755 -o "$RUN_USER" -g "$RUN_GROUP" "$LOG_DIR"
-    chown -R "${RUN_USER}:${RUN_GROUP}" "$LOG_DIR" 2>/dev/null || warn "日志目录权限调整失败"
+
+    # 日志目录必须由运行用户可写，否则启动时报 access.log permission denied
+    install -d -m 755 "$LOG_DIR"
+    touch "${LOG_DIR}/access.log" "${LOG_DIR}/error.log" || die "无法创建日志文件：${LOG_DIR}"
+    chown -R "${RUN_USER}:${RUN_GROUP}" "$LOG_DIR" || die "日志目录授权失败：${LOG_DIR}"
+    chmod 755 "$LOG_DIR"
+    chmod 644 "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
 
     if [[ -f "$CONFIG_FILE" ]]; then
         local backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
