@@ -1,0 +1,89 @@
+name: Sync Upstream Files
+
+# 下游手动同步上游文件：
+# 仓库 Actions 页 → Sync Upstream Files → Run workflow → 填上游仓库 / 分支 / 文件列表
+# 文件列表留空时同步整个上游仓库（排除上游 .github，不删除下游独有文件）
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: '上游仓库（owner/repo）'
+        required: true
+      upstream_branch:
+        description: '上游分支（默认 main）'
+        required: false
+        default: 'main'
+      files:
+        description: '要同步的文件（逗号分隔，留空=整个仓库）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出下游仓库
+        uses: actions/checkout@v4
+
+      - name: 下载并同步上游文件
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          FILES: ${{ inputs.files }}
+          TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 私有上游需要 UPSTREAM_TOKEN（需上游仓库读权限），公开上游可留空
+          if [[ -n "$TOKEN" ]]; then
+            echo "::add-mask::$TOKEN"
+            git clone --quiet --depth 1 --branch "$UPSTREAM_BRANCH" \
+              "https://x-access-token:${TOKEN}@github.com/${UPSTREAM_REPO}.git" /tmp/upstream_src \
+              || { echo "::error::上游克隆失败：请检查仓库名、分支或 UPSTREAM_TOKEN"; exit 1; }
+          else
+            git clone --quiet --depth 1 --branch "$UPSTREAM_BRANCH" \
+              "https://github.com/${UPSTREAM_REPO}.git" /tmp/upstream_src \
+              || { echo "::error::上游克隆失败：请检查仓库名与分支"; exit 1; }
+          fi
+          src=/tmp/upstream_src
+
+          if [[ -n "${FILES//[[:space:]]/}" ]]; then
+            # 指定文件模式：逗号分隔，逐个覆盖到本仓库
+            IFS=',' read -ra arr <<< "$FILES"
+            for f in "${arr[@]}"; do
+              f="$(printf '%s' "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              f="${f#./}"
+              [[ -n "$f" ]] || continue
+              if [[ ! -f "$src/$f" ]]; then
+                echo "::error::上游不存在该文件：$f"
+                exit 1
+              fi
+              mkdir -p "$(dirname "$f")"
+              cp -a "$src/$f" "$f"
+              echo "已同步：$f"
+            done
+          else
+            # 整库模式：只覆盖/新增，不删除下游独有文件，不同步上游 .github
+            rsync -a --exclude '.github/' --exclude '.git/' "$src"/ ./
+            echo "已同步整个上游仓库（排除 .github，未删除下游独有文件）"
+          fi
+
+      - name: 提交变更
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "无变更，跳过提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "sync: 同步上游 ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}"
+          git push
