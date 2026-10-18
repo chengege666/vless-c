@@ -43,6 +43,8 @@ DOMAIN=""
 EMAIL=""
 UUID=""
 WS_PATH=""
+NODE_NAME="${DEFAULT_NODE_NAME}"
+CERT_SOURCE="auto"
 SERVER_IP=""
 RUN_USER="nobody"
 RUN_GROUP="nogroup"
@@ -195,6 +197,27 @@ ask_node_name() {
     log "节点名称：${NODE_NAME}"
 }
 
+# 选择证书来源：自动申请 / 已有证书文件 / 已安装证书
+ask_cert_source() {
+    CERT_SOURCE="auto"
+    [[ -t 0 ]] || return 0
+
+    printf '\n选择证书来源：\n'
+    printf '  1) 自动申请 Let'"'"'s Encrypt（HTTP-01，需 80 端口）\n'
+    printf '  2) 使用本机已有证书文件（手动输入路径）\n'
+    printf '  3) 使用已安装到 %s 的证书\n' "$CERT_DIR"
+
+    local choice
+    read -r -p "请选择 [1-3]（回车默认 1）：" choice || return 0
+    case "${choice:-1}" in
+        1) CERT_SOURCE="auto" ;;
+        2) CERT_SOURCE="file" ;;
+        3) CERT_SOURCE="existing" ;;
+        *) warn "无效选项，使用自动申请"; CERT_SOURCE="auto" ;;
+    esac
+    log "证书来源：${CERT_SOURCE}"
+}
+
 # ------------------------------ 端口占用 --------------------------------------
 free_port_80() {
     local holders=""
@@ -279,9 +302,26 @@ issue_cert() {
     "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 \
         || warn "设置默认 CA 失败，将使用 acme.sh 当前默认 CA"
 
-    if ! "$ACME_BIN" --issue --standalone -d "$DOMAIN" --keylength ec-256 --httpport 80; then
-        die "证书申请失败，请确认域名解析正确且 80 端口公网可访问"
+    local log_file rc=0
+    log_file="$(mktemp)"
+    "$ACME_BIN" --issue --standalone -d "$DOMAIN" --keylength ec-256 --httpport 80 2>&1 \
+        | tee "$log_file" || rc=${PIPESTATUS[0]}
+
+    if (( rc != 0 )); then
+        # 按 acme.sh 输出给出针对性提示，避免笼统报错
+        if grep -q 'NXDOMAIN' "$log_file" 2>/dev/null; then
+            err "DNS 查询失败（NXDOMAIN）：域名未解析或记录尚未生效"
+        elif grep -qE 'Connection refused|Timeout|timed out' "$log_file" 2>/dev/null; then
+            err "80 端口公网不可达：请检查安全组、NAT 端口映射与防火墙"
+            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 9 → 3）"
+        elif grep -q 'Invalid response' "$log_file" 2>/dev/null; then
+            err "80 端口被其他服务占用或响应异常"
+        fi
+        rm -f "$log_file"
+        die "证书申请失败，建议改用 DNS-01 验证或使用已有证书"
     fi
+
+    rm -f "$log_file"
     log "证书申请成功"
 }
 
@@ -305,6 +345,98 @@ install_cert() {
     chmod 640 "${CERT_DIR}/privkey.pem"
     chmod 644 "${CERT_DIR}/fullchain.pem"
     log "证书已安装：${CERT_DIR}"
+}
+
+# 校验证书与私钥是否匹配（支持 RSA 与 EC）
+cert_is_valid() {
+    local cert="$1" key="$2"
+    [[ -s "$cert" && -s "$key" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 0
+
+    openssl x509 -in "$cert" -noout >/dev/null 2>&1 || return 1
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+
+    local cert_md5 key_md5
+    cert_md5="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null || true)"
+    key_md5="$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl md5 2>/dev/null || true)"
+    [[ -n "$cert_md5" && "$cert_md5" == "$key_md5" ]] || return 1
+    return 0
+}
+
+# 统一修正证书目录权限，保证 nobody 可读
+fix_cert_perms() {
+    chown root:"$RUN_GROUP" "$CERT_DIR" "${CERT_DIR}/privkey.pem" "${CERT_DIR}/fullchain.pem" 2>/dev/null \
+        || warn "证书属组调整失败，可能导致 Xray 无法读取证书"
+    chmod 750 "$CERT_DIR"
+    chmod 640 "${CERT_DIR}/privkey.pem"
+    chmod 644 "${CERT_DIR}/fullchain.pem"
+}
+
+# 使用用户指定的证书文件
+use_cert_files() {
+    local cert key
+    [[ -t 0 ]] || die "使用自有证书时需要在交互终端输入路径"
+
+    read -r -p "证书链文件路径（fullchain.pem）：" cert || return 1
+    read -r -p "私钥文件路径（privkey.pem）：" key || return 1
+    cert="${cert/#\~/$HOME}"
+    key="${key/#\~/$HOME}"
+
+    [[ -n "$cert" && -n "$key" ]] || die "证书路径不能为空"
+    [[ -f "$cert" ]] || die "证书文件不存在：${cert}"
+    [[ -f "$key" ]] || die "私钥文件不存在：${key}"
+    cert_is_valid "$cert" "$key" || die "证书与私钥不匹配，或文件格式无效"
+
+    install -d -m 750 -o root -g "$RUN_GROUP" "$CERT_DIR" || die "无法创建证书目录：${CERT_DIR}"
+
+    # 避免源文件与目标文件相同导致内容被清空
+    if [[ ! "$cert" -ef "${CERT_DIR}/fullchain.pem" ]]; then
+        cat "$cert" > "${CERT_DIR}/fullchain.pem" || die "复制证书失败"
+    fi
+    if [[ ! "$key" -ef "${CERT_DIR}/privkey.pem" ]]; then
+        cat "$key" > "${CERT_DIR}/privkey.pem" || die "复制私钥失败"
+    fi
+
+    fix_cert_perms
+    log "已导入自有证书：${CERT_DIR}"
+}
+
+# 使用已安装到 CERT_DIR 的证书
+use_installed_cert() {
+    local cert="${CERT_DIR}/fullchain.pem" key="${CERT_DIR}/privkey.pem"
+    [[ -s "$cert" && -s "$key" ]] \
+        || die "未找到已安装证书，请先在总菜单 9 中申请并安装到 ${CERT_DIR}"
+    cert_is_valid "$cert" "$key" || die "已安装的证书与私钥不匹配，请重新安装证书"
+    fix_cert_perms
+    log "使用已安装证书：${CERT_DIR}"
+}
+
+# 按来源准备证书
+prepare_cert() {
+    case "$CERT_SOURCE" in
+        auto)
+            install_acme
+            issue_cert
+            install_cert
+            ;;
+        file)
+            install_deps_quiet_openssl
+            use_cert_files
+            ;;
+        existing)
+            use_installed_cert
+            ;;
+        *)
+            die "未知的证书来源：${CERT_SOURCE}"
+            ;;
+    esac
+}
+
+# 确保 openssl 可用（导入自有证书时需要）
+install_deps_quiet_openssl() {
+    command -v openssl >/dev/null 2>&1 && return 0
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssl \
+        || die "openssl 安装失败，无法校验证书"
 }
 
 # ------------------------------ 参数生成 --------------------------------------
@@ -580,16 +712,18 @@ main() {
     ask_domain
     ask_email
     ask_node_name
+    ask_cert_source
 
-    free_port_80
+    # 仅自动申请时才需要占用 80 端口
+    if [[ "$CERT_SOURCE" == "auto" ]]; then
+        free_port_80
+    fi
     ensure_xray
-    install_acme
-    issue_cert
+    # 先准备好证书，再写配置，避免配置校验时证书文件不存在
+    prepare_cert
 
     gen_uuid
     gen_ws_path
-    # 先安装证书，再写配置，避免配置校验时证书文件不存在
-    install_cert
     write_config
     write_service
     start_service

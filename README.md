@@ -80,8 +80,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/chengege666/vless-c/main/cgg
   4) 启动 Xray 服务
   5) 停止 Xray 服务
   6) 重启 Xray 服务
-  7) 修改 Reality 配置（SNI / UUID）
-  8) 一键彻底卸载
+  7) 修改配置（节点名称 / SNI / UUID）
+  8) SSL 证书管理（acme.sh 申请 / 续期 / 安装）
+  9) 一键彻底卸载
   0) 退出
 ==========================================================
 ```
@@ -89,7 +90,42 @@ bash <(curl -fsSL https://raw.githubusercontent.com/chengege666/vless-c/main/cgg
 - 菜单会自动识别当前模式并显示在顶部
 - Reality 与 WS+TLS 共用同一份配置与服务，**同一时间只能存在一种模式**
 - 切换模式时会提示将覆盖现有配置，需确认
-- 第 7 项仅在 Reality 模式下可用
+- 第 7 项中「节点名称」两种模式都可用，SNI / UUID 仅 Reality 可用
+
+## SSL 证书管理
+
+总菜单第 8 项提供独立的 acme.sh 证书管理，适合 80 端口不可用（NAT、只映射高位端口、云防火墙限制）的场景：
+
+```
+-------- SSL 证书管理 (acme.sh) --------
+  1) 安装 / 检查 acme.sh
+  2) 申请证书（HTTP-01，需 80 端口）
+  3) 申请证书（DNS-01，Cloudflare / 阿里云）
+  4) 查看已申请证书
+  5) 手动续期
+  6) 安装 / 更新证书到 Xray 目录
+  7) 删除证书
+  0) 返回主菜单
+```
+
+DNS-01 说明：
+
+- 不需要开放 80 端口，支持 `*.example.com` 泛域名
+- Cloudflare：需创建 API Token，权限为 **Zone → DNS → Edit**，并限制到对应域名
+- 阿里云：需 AccessKey ID / Secret，账号需具备 DNS 解析权限
+- 凭据由 acme.sh 自动保存到 `/root/.acme.sh/account.conf`，续期时复用
+- 申请完成后选第 6 项安装到 `/usr/local/etc/xray/cert/`，再安装 WS+TLS 节点时选择「使用已安装证书」
+
+WS+TLS 安装时新增证书来源选择：
+
+```
+选择证书来源：
+  1) 自动申请 Let's Encrypt（HTTP-01，需 80 端口）
+  2) 使用本机已有证书文件（手动输入路径）
+  3) 使用已安装到 /usr/local/etc/xray/cert 的证书
+```
+
+选项 2 会校验证书与私钥是否匹配（OpenSSL 比对公钥指纹），并自动修正属组与权限。
 
 ## 两种模式对比
 
@@ -179,13 +215,15 @@ WS+TLS 模式套 CDN 时：
 
 修改配置：
 
-- Reality：总菜单第 `7` 项，可更换 SNI 或重置 UUID
-- WS+TLS：目前需修改 `/usr/local/etc/xray/config.json` 后重启服务
+- 两种模式均可在总菜单第 `7` 项修改节点名称（仅影响分享链接备注）
+- Reality：同一菜单可更换 SNI 或重置 UUID
+- WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
 彻底卸载：
 
-- 总菜单第 `8` 项，输入 `yes` 确认
+- 总菜单第 `9` 项，输入 `yes` 确认
 - 会删除 Xray 核心、配置、日志、systemd 服务与 `/opt/cgg-vless` 缓存
+- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 8 项
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
 ```bash
@@ -230,12 +268,22 @@ journalctl -u xray -n 50 --no-pager
 
 **WS+TLS 证书申请失败**
 
-确认域名解析已生效、80 端口未被占用且安全组已放行：
+先看 acme.sh 的具体报错分类：
+
+| 报错关键字 | 含义 | 处理 |
+|---|---|---|
+| `NXDOMAIN` | 域名未解析或记录未生效 | 检查 A 记录，等待传播 |
+| `Connection refused` / `Timeout` | 80 端口公网不可达 | 检查安全组、NAT 端口映射、防火墙 |
+| `Invalid response` | 80 端口被其他服务占用 | 停用占用服务后重试 |
+
+自查命令：
 
 ```bash
 dig +short 你的域名
 ss -lntp 'sport = :80'
 ```
+
+80 端口无法开放时，改用 DNS-01 验证（总菜单 `8` → `3`），无需 80 端口。
 
 **Reality 客户端连不上**
 

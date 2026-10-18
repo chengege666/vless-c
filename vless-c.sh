@@ -17,6 +17,8 @@ readonly CERT_DIR="${CONFIG_DIR}/cert"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly CACHE_DIR="/opt/cgg-vless"
+readonly ACME_HOME="/root/.acme.sh"
+readonly ACME_BIN="${ACME_HOME}/acme.sh"
 readonly REPO_RAW="${CGG_RAW_BASE:-https://raw.githubusercontent.com/chengege666/vless-c/main}"
 
 # 子脚本文件名
@@ -311,9 +313,13 @@ show_info_ws() {
         return 1
     fi
 
-    domain="$(extract_cert_domain || true)"
+    # 优先使用安装时记录的域名，避免证书为泛域名时无法作为 SNI
+    domain="$(read_info_value DOMAIN || true)"
     if [[ -z "$domain" ]]; then
-        warn "无法从证书中提取域名，请手动填写 SNI"
+        domain="$(extract_cert_domain || true)"
+    fi
+    if [[ -z "$domain" || "$domain" == \*.* ]]; then
+        warn "无法确定可用域名，请手动填写 SNI"
         domain="YOUR_DOMAIN"
     fi
 
@@ -609,6 +615,268 @@ modify_menu() {
     done
 }
 
+# ------------------------------ SSL 证书管理 (acme.sh) ------------------------
+acme_ensure() {
+    if [[ -x "$ACME_BIN" ]]; then
+        log "acme.sh 已安装：$("$ACME_BIN" --version 2>/dev/null | head -n 1)"
+        return 0
+    fi
+
+    command -v curl >/dev/null 2>&1 || { err "缺少 curl，请先安装 curl"; return 1; }
+
+    # acme.sh 依赖 crontab 创建自动续期任务
+    if ! command -v crontab >/dev/null 2>&1; then
+        command -v apt-get >/dev/null 2>&1 || { err "缺少 crontab 且无 apt-get"; return 1; }
+        log "安装 cron（自动续期依赖）"
+        apt-get update -y >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cron \
+            || { err "cron 安装失败"; return 1; }
+        systemctl enable cron >/dev/null 2>&1 || true
+        systemctl start cron >/dev/null 2>&1 || true
+    fi
+
+    log "安装 acme.sh..."
+    if ! curl -fsSL --retry 3 --connect-timeout 15 https://get.acme.sh | sh; then
+        err "acme.sh 下载或安装失败，请检查网络"
+        return 1
+    fi
+    [[ -x "$ACME_BIN" ]] || { err "安装后未找到 ${ACME_BIN}"; return 1; }
+
+    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 \
+        || warn "设置默认 CA 失败，将使用 acme.sh 当前默认 CA"
+    log "acme.sh 安装完成"
+}
+
+# 普通域名校验
+is_domain() {
+    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+
+# 证书域名校验，兼容 *.example.com 通配符
+is_cert_domain() {
+    local d="$1"
+    d="${d#\*.}"
+    is_domain "$d"
+}
+
+# 定位 acme.sh 保存的证书目录
+acme_cert_dir() {
+    local domain="$1"
+    [[ -d "${ACME_HOME}/${domain}_ecc" ]] && { printf '%s' "${ACME_HOME}/${domain}_ecc"; return 0; }
+    [[ -d "${ACME_HOME}/${domain}" ]] && { printf '%s' "${ACME_HOME}/${domain}"; return 0; }
+    return 1
+}
+
+acme_is_ecc() {
+    [[ -d "${ACME_HOME}/${1}_ecc" ]]
+}
+
+# 申请证书：HTTP-01 Standalone（需要 80 端口）
+cert_issue_http() {
+    acme_ensure || return 1
+
+    local domain
+    read -r -p "请输入域名：" domain
+    is_cert_domain "$domain" || { err "域名格式不合法：${domain}"; return 1; }
+
+    if command -v ss >/dev/null 2>&1 && ss -H -ltn 'sport = :80' 2>/dev/null | grep -q .; then
+        warn "80 端口已被占用，Standalone 验证可能失败"
+    fi
+
+    log "开始 HTTP-01 验证申请：${domain}"
+    if ! "$ACME_BIN" --issue --standalone -d "$domain" --keylength ec-256 --httpport 80; then
+        err "申请失败：请确认 80 端口公网可达，或改用 DNS-01 验证"
+        return 1
+    fi
+    log "证书申请成功：${domain}"
+}
+
+# 配置 DNS API 凭据（由 acme.sh 自动保存到 account.conf）
+cert_configure_dns() {
+    local provider="$1" token key secret
+
+    case "$provider" in
+        dns_cf)
+            if grep -q '^CF_Token=' "${ACME_HOME}/account.conf" 2>/dev/null; then
+                log "已保存 CF_Token，跳过输入"
+                return 0
+            fi
+            read -r -s -p "Cloudflare API Token（需 Zone.DNS 编辑权限）：" token || return 1
+            printf '\n'
+            [[ -n "$token" ]] || { err "CF_Token 不能为空"; return 1; }
+            export CF_Token="$token"
+            ;;
+        dns_ali)
+            if grep -q '^Ali_Key=' "${ACME_HOME}/account.conf" 2>/dev/null \
+                && grep -q '^Ali_Secret=' "${ACME_HOME}/account.conf" 2>/dev/null; then
+                log "已保存阿里云 AccessKey，跳过输入"
+                return 0
+            fi
+            read -r -p "请输入 AccessKey ID：" key || return 1
+            read -r -s -p "请输入 AccessKey Secret：" secret || return 1
+            printf '\n'
+            [[ -n "$key" && -n "$secret" ]] || { err "AccessKey 不能为空"; return 1; }
+            export Ali_Key="$key"
+            export Ali_Secret="$secret"
+            ;;
+        *)
+            err "暂不支持该 DNS 提供商：${provider}"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# 申请证书：DNS-01（支持泛域名，不需要 80 端口）
+cert_issue_dns() {
+    acme_ensure || return 1
+
+    local domain provider choice
+    read -r -p "请输入域名（泛域名示例 *.example.com）：" domain
+    is_cert_domain "$domain" || { err "域名格式不合法：${domain}"; return 1; }
+
+    printf '  1) Cloudflare（dns_cf）\n'
+    printf '  2) 阿里云（dns_ali）\n'
+    read -r -p "请选择 DNS 提供商 [1-2]（回车默认 1）：" choice
+    case "${choice:-1}" in
+        1) provider="dns_cf" ;;
+        2) provider="dns_ali" ;;
+        *) err "无效选项：${choice}"; return 1 ;;
+    esac
+
+    cert_configure_dns "$provider" || return 1
+
+    log "开始 DNS-01 验证申请：${domain}（${provider}）"
+    if ! "$ACME_BIN" --issue --dns "$provider" -d "$domain" --keylength ec-256; then
+        err "申请失败：请确认 API 凭据权限正确，且域名在该账号下"
+        return 1
+    fi
+    log "证书申请成功：${domain}"
+}
+
+cert_list() {
+    acme_ensure || return 1
+    "$ACME_BIN" --list
+}
+
+cert_renew() {
+    acme_ensure || return 1
+
+    local domain
+    read -r -p "请输入要续期的域名：" domain || return 1
+    is_cert_domain "$domain" || { err "域名格式不合法：${domain}"; return 1; }
+    acme_cert_dir "$domain" >/dev/null || { err "未找到该域名的证书，请先申请"; return 1; }
+
+    if acme_is_ecc "$domain"; then
+        "$ACME_BIN" --renew -d "$domain" --ecc --force || { err "续期失败"; return 1; }
+    else
+        "$ACME_BIN" --renew -d "$domain" --force || { err "续期失败"; return 1; }
+    fi
+    log "续期完成：${domain}"
+
+    cert_install_to_xray "$domain" || true
+}
+
+# 将证书安装到 Xray 目录，供 VLESS + WS + TLS 使用
+cert_install_to_xray() {
+    local domain="${1:-}" group reload
+
+    acme_ensure || return 1
+
+    if [[ -z "$domain" ]]; then
+        read -r -p "请输入证书域名：" domain
+    fi
+    is_cert_domain "$domain" || { err "域名格式不合法：${domain}"; return 1; }
+    acme_cert_dir "$domain" >/dev/null || { err "未找到该域名的证书，请先申请"; return 1; }
+
+    if getent group nogroup >/dev/null 2>&1; then
+        group="nogroup"
+    else
+        group="$(id -gn nobody 2>/dev/null || echo root)"
+    fi
+
+    install -d -m 750 -o root -g "$group" "$CERT_DIR" || { err "无法创建证书目录：${CERT_DIR}"; return 1; }
+
+    reload="chown root:${group} ${CERT_DIR}/privkey.pem ${CERT_DIR}/fullchain.pem 2>/dev/null; chmod 640 ${CERT_DIR}/privkey.pem; chmod 644 ${CERT_DIR}/fullchain.pem; systemctl restart xray 2>/dev/null || true"
+
+    if acme_is_ecc "$domain"; then
+        "$ACME_BIN" --install-cert -d "$domain" --ecc \
+            --key-file "${CERT_DIR}/privkey.pem" \
+            --fullchain-file "${CERT_DIR}/fullchain.pem" \
+            --reloadcmd "$reload" || { err "证书安装失败"; return 1; }
+    else
+        "$ACME_BIN" --install-cert -d "$domain" \
+            --key-file "${CERT_DIR}/privkey.pem" \
+            --fullchain-file "${CERT_DIR}/fullchain.pem" \
+            --reloadcmd "$reload" || { err "证书安装失败"; return 1; }
+    fi
+
+    [[ -s "${CERT_DIR}/privkey.pem" ]] || { err "私钥文件不存在"; return 1; }
+    [[ -s "${CERT_DIR}/fullchain.pem" ]] || { err "证书文件不存在"; return 1; }
+
+    chown root:"$group" "$CERT_DIR" "${CERT_DIR}/privkey.pem" "${CERT_DIR}/fullchain.pem" 2>/dev/null \
+        || warn "证书属组调整失败"
+    chmod 750 "$CERT_DIR"
+    chmod 640 "${CERT_DIR}/privkey.pem"
+    chmod 644 "${CERT_DIR}/fullchain.pem"
+
+    log "证书已安装到：${CERT_DIR}"
+    log "如当前为 WS+TLS 模式，安装子脚本时选择「使用已安装证书」即可复用"
+}
+
+cert_remove() {
+    acme_ensure || return 1
+
+    local domain ans
+    "$ACME_BIN" --list || true
+    read -r -p "请输入要删除的证书域名（输入 0 取消）：" domain
+    [[ -z "$domain" || "$domain" == "0" ]] && { warn "已取消"; return 1; }
+
+    read -r -p "确认删除 ${domain} 的证书？[y/N]：" ans
+    case "$ans" in
+        [Yy]*) ;;
+        *) warn "已取消"; return 1 ;;
+    esac
+
+    if acme_is_ecc "$domain"; then
+        "$ACME_BIN" --remove -d "$domain" --ecc >/dev/null 2>&1 || warn "acme.sh 删除记录失败"
+    else
+        "$ACME_BIN" --remove -d "$domain" >/dev/null 2>&1 || warn "acme.sh 删除记录失败"
+    fi
+    rm -rf "${ACME_HOME:?}/${domain}" "${ACME_HOME:?}/${domain}_ecc"
+    log "已删除证书：${domain}"
+}
+
+cert_menu() {
+    local choice
+    while true; do
+        printf '\n%s-------- SSL 证书管理 (acme.sh) --------%s\n' "$C_CYAN" "$C_RESET"
+        printf '  1) 安装 / 检查 acme.sh\n'
+        printf '  2) 申请证书（HTTP-01，需 80 端口）\n'
+        printf '  3) 申请证书（DNS-01，Cloudflare / 阿里云）\n'
+        printf '  4) 查看已申请证书\n'
+        printf '  5) 手动续期\n'
+        printf '  6) 安装 / 更新证书到 Xray 目录\n'
+        printf '  7) 删除证书\n'
+        printf '  0) 返回主菜单\n'
+        if ! read -r -p "请选择 [0-7]：" choice; then
+            printf '\n'
+            return 0
+        fi
+        case "$choice" in
+            1) acme_ensure || true ;;
+            2) cert_issue_http || true ;;
+            3) cert_issue_dns || true ;;
+            4) cert_list || true ;;
+            5) cert_renew || true ;;
+            6) cert_install_to_xray || true ;;
+            7) cert_remove || true ;;
+            0) return 0 ;;
+            *) warn "无效选项：${choice}" ;;
+        esac
+    done
+}
+
 # ------------------------------ 彻底卸载 --------------------------------------
 uninstall_all() {
     local ans
@@ -672,7 +940,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-8]：" choice; then
+        if ! read -r -p "请选择 [0-9]：" choice; then
             printf '\n'
             return 0
         fi
@@ -684,7 +952,8 @@ main_menu() {
             5) service_action stop || true ;;
             6) service_action restart || true ;;
             7) modify_menu || true ;;
-            8) uninstall_all || true ;;
+            8) cert_menu ;;
+            9) uninstall_all || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
