@@ -926,7 +926,8 @@ show_menu() {
     printf '  5) 停止 Xray 服务\n'
     printf '  6) 重启 Xray 服务\n'
     printf '  7) 修改配置（节点名称 / SNI / UUID）\n'
-    printf '  8) 一键彻底卸载\n'
+    printf '  8) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
+    printf '  9) 一键彻底卸载\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
