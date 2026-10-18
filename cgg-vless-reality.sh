@@ -11,10 +11,12 @@ set -euo pipefail
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly DEFAULT_SNI="itunes.apple.com"
+readonly DEFAULT_NODE_NAME="cgg-vless"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -37,6 +39,7 @@ fi
 PORT=""
 SNI=""
 UUID=""
+NODE_NAME="${DEFAULT_NODE_NAME}"
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
@@ -201,6 +204,21 @@ ask_sni() {
     log "伪装域名 SNI：${SNI}"
 }
 
+ask_node_name() {
+    local input
+    NODE_NAME="$DEFAULT_NODE_NAME"
+    if [[ -t 0 ]]; then
+        read -r -p "节点名称（显示在客户端备注，回车默认 ${DEFAULT_NODE_NAME}）：" input
+        # 去掉分隔符与空白，避免破坏 vless:// 链接格式
+        input="${input//[#?&%/]/}"
+        input="${input// /_}"
+        if [[ -n "$input" ]]; then
+            NODE_NAME="$input"
+        fi
+    fi
+    log "节点名称：${NODE_NAME}"
+}
+
 # ------------------------------ 安装 Xray -------------------------------------
 ensure_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
@@ -349,7 +367,22 @@ EOF
         die "Xray 配置校验失败，未启动服务"
     fi
     rm -f "$test_log"
+    save_info
     log "配置写入并校验通过：${CONFIG_FILE}"
+}
+
+# 保存节点元信息，供管理菜单读取（名称、公钥等）
+save_info() {
+    {
+        printf 'MODE=reality\n'
+        printf 'PORT=%s\n' "$PORT"
+        printf 'UUID=%s\n' "$UUID"
+        printf 'SNI=%s\n' "$SNI"
+        printf 'PUBLIC_KEY=%s\n' "$PUBLIC_KEY"
+        printf 'SHORT_ID=%s\n' "$SHORT_ID"
+        printf 'NODE_NAME=%s\n' "$NODE_NAME"
+    } > "$INFO_FILE"
+    chmod 600 "$INFO_FILE"
 }
 
 # ------------------------------ systemd 服务 ----------------------------------
@@ -487,9 +520,10 @@ print_result() {
         fi
     fi
 
-    link="vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#cgg-vless"
+    link="vless://${UUID}@${ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${NODE_NAME}"
 
     printf '\n%s================= cgg-vless 节点信息 =================%s\n' "$C_CYAN" "$C_RESET"
+    printf '  节点名称    : %s\n' "$NODE_NAME"
     printf '  地址 (IP)   : %s\n' "$ip"
     printf '  端口        : %s\n' "$PORT"
     printf '  UUID        : %s\n' "$UUID"
@@ -528,6 +562,7 @@ main() {
 
     ask_port
     ask_sni
+    ask_node_name
 
     install_deps
     check_network

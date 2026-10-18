@@ -243,11 +243,14 @@ load_reality() {
 
     [[ -n "$R_PORT" && -n "$R_UUID" && -n "$R_SNI" && -n "$R_PRIVATE_KEY" && -n "$R_SHORT_ID" ]] || return 1
 
-    # 优先读取安装时保存的公钥
+    # 优先读取安装时保存的公钥与节点名称
     R_PUBLIC_KEY=""
+    R_NODE_NAME=""
     if [[ -f "$INFO_FILE" ]]; then
-        R_PUBLIC_KEY="$(. "$INFO_FILE" >/dev/null 2>&1; printf '%s' "${PUBLIC_KEY:-}")"
+        R_PUBLIC_KEY="$(read_info_value PUBLIC_KEY || true)"
+        R_NODE_NAME="$(read_info_value NODE_NAME || true)"
     fi
+    [[ -n "$R_NODE_NAME" ]] || R_NODE_NAME="cgg-vless"
 
     # 元信息缺失时由私钥反推公钥
     if [[ -z "$R_PUBLIC_KEY" ]]; then
@@ -316,10 +319,13 @@ show_info_ws() {
 
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
     enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
-    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#cgg-vless-ws"
+    node_name="$(read_info_value NODE_NAME || true)"
+    [[ -n "$node_name" ]] || node_name="cgg-vless-ws"
+    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#${node_name}"
 
     printf '\n%s============= cgg-vless WS + TLS 节点 =============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + WebSocket + TLS\n'
+    printf '  节点名称    : %s\n' "$node_name"
     printf '  地址 (IP)   : %s\n' "$ip"
     printf '  端口        : %s\n' "$port"
     printf '  域名        : %s\n' "$domain"
@@ -517,27 +523,86 @@ reset_uuid() {
     restart_after_change
 }
 
+# 修改节点名称（Reality / WS 均可用）
+change_node_name() {
+    local mode current input
+    mode="$(detect_mode)"
+
+    case "$mode" in
+        reality)
+            if ! load_reality; then
+                err "Reality 配置读取失败，请先执行安装"
+                return 1
+            fi
+            current="$R_NODE_NAME"
+            ;;
+        ws)
+            current="$(read_info_value NODE_NAME || true)"
+            [[ -n "$current" ]] || current="cgg-vless-ws"
+            ;;
+        *)
+            err "未找到有效配置，请先执行安装"
+            return 1
+            ;;
+    esac
+
+    read -r -p "请输入新的节点名称（当前 ${current}，回车取消）：" input
+    # 去掉分隔符与空白，避免破坏 vless:// 链接格式
+    input="${input//[#?&%/]/}"
+    input="${input// /_}"
+    [[ -n "$input" ]] || { warn "输入为空，已取消"; return 1; }
+
+    update_info_node_name "$input"
+    log "节点名称已更新为：${input}"
+
+    # 名称仅影响分享链接备注，无需重启服务
+    SERVER_IP="$(get_public_ip)"
+    if [[ "$mode" == "reality" ]]; then
+        if load_reality; then
+            show_info_reality
+        fi
+    else
+        show_info_ws
+    fi
+}
+
 modify_menu() {
     local mode choice
     mode="$(detect_mode)"
 
-    if [[ "$mode" != "reality" ]]; then
-        err "当前未使用 Reality 模式（检测结果：${mode}），该功能仅支持 Reality"
+    if [[ "$mode" != "reality" && "$mode" != "ws" ]]; then
+        err "未找到有效配置，请先执行安装"
         return 1
     fi
 
     while true; do
-        printf '\n%s-------- 修改 Reality 配置 --------%s\n' "$C_CYAN" "$C_RESET"
-        printf '  1) 更换伪装域名 SNI\n'
-        printf '  2) 重置 UUID\n'
+        printf '\n%s-------- 修改配置（当前模式：%s）--------%s\n' "$C_CYAN" "$mode" "$C_RESET"
+        printf '  1) 修改节点名称\n'
+        if [[ "$mode" == "reality" ]]; then
+            printf '  2) 更换伪装域名 SNI\n'
+            printf '  3) 重置 UUID\n'
+        fi
         printf '  0) 返回主菜单\n'
-        if ! read -r -p "请选择 [0-2]：" choice; then
+        if ! read -r -p "请选择：" choice; then
             printf '\n'
             return 0
         fi
         case "$choice" in
-            1) change_sni || true ;;
-            2) reset_uuid || true ;;
+            1) change_node_name || true ;;
+            2)
+                if [[ "$mode" == "reality" ]]; then
+                    change_sni || true
+                else
+                    warn "WS+TLS 模式不支持修改 SNI"
+                fi
+                ;;
+            3)
+                if [[ "$mode" == "reality" ]]; then
+                    reset_uuid || true
+                else
+                    warn "无效选项：${choice}"
+                fi
+                ;;
             0) return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
@@ -592,7 +657,7 @@ show_menu() {
     printf '  4) 启动 Xray 服务\n'
     printf '  5) 停止 Xray 服务\n'
     printf '  6) 重启 Xray 服务\n'
-    printf '  7) 修改 Reality 配置（SNI / UUID）\n'
+    printf '  7) 修改配置（节点名称 / SNI / UUID）\n'
     printf '  8) 一键彻底卸载\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"

@@ -11,6 +11,7 @@ set -euo pipefail
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
@@ -18,6 +19,7 @@ readonly ACME_HOME="/root/.acme.sh"
 readonly ACME_BIN="${ACME_HOME}/acme.sh"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly LISTEN_PORT="443"
+readonly DEFAULT_NODE_NAME="cgg-vless-ws"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -176,6 +178,21 @@ ask_email() {
         read -r -p "Let's Encrypt 通知邮箱（可回车跳过）： " input
         EMAIL="${input//[[:space:]]/}"
     fi
+}
+
+ask_node_name() {
+    local input
+    NODE_NAME="$DEFAULT_NODE_NAME"
+    if [[ -t 0 ]]; then
+        read -r -p "节点名称（显示在客户端备注，回车默认 ${DEFAULT_NODE_NAME}）：" input
+        # 去掉分隔符与空白，避免破坏 vless:// 链接格式
+        input="${input//[#?&%/]/}"
+        input="${input// /_}"
+        if [[ -n "$input" ]]; then
+            NODE_NAME="$input"
+        fi
+    fi
+    log "节点名称：${NODE_NAME}"
 }
 
 # ------------------------------ 端口占用 --------------------------------------
@@ -397,7 +414,21 @@ EOF
         die "Xray 配置校验失败，未启动服务"
     fi
     rm -f "$test_log"
+    save_info
     log "配置写入并校验通过：${CONFIG_FILE}"
+}
+
+# 保存节点元信息，供管理菜单读取（名称、路径等）
+save_info() {
+    {
+        printf 'MODE=ws\n'
+        printf 'PORT=%s\n' "$LISTEN_PORT"
+        printf 'UUID=%s\n' "$UUID"
+        printf 'DOMAIN=%s\n' "$DOMAIN"
+        printf 'WS_PATH=%s\n' "$WS_PATH"
+        printf 'NODE_NAME=%s\n' "$NODE_NAME"
+    } > "$INFO_FILE"
+    chmod 600 "$INFO_FILE"
 }
 
 # ------------------------------ systemd 服务 ----------------------------------
@@ -502,9 +533,10 @@ print_result() {
     fi
 
     # CDN 场景下地址应填 CDN 优选域名/IP，此处默认输出源站 IP
-    link="vless://${UUID}@${ip}:${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')#cgg-vless-ws"
+    link="vless://${UUID}@${ip}:${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')#${NODE_NAME}"
 
     printf '\n%s=============== cgg-vless WS+TLS 节点信息 ===============%s\n' "$C_CYAN" "$C_RESET"
+    printf '  节点名称    : %s\n' "$NODE_NAME"
     printf '  地址 (IP)   : %s\n' "$ip"
     printf '  端口        : %s\n' "$LISTEN_PORT"
     printf '  域名        : %s\n' "$DOMAIN"
@@ -547,6 +579,7 @@ main() {
 
     ask_domain
     ask_email
+    ask_node_name
 
     free_port_80
     ensure_xray
