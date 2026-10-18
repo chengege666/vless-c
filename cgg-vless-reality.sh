@@ -237,7 +237,7 @@ ensure_xray() {
     rm -f "$installer"
     (( rc == 0 )) || die "Xray 安装失败（退出码 ${rc}）"
     [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
-    log "Xray 安装完成：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
+    verify_xray_runtime || die "Xray 安装完成但无法运行，请按上方提示排查"
 }
 
 # ------------------------------ 参数生成 --------------------------------------
