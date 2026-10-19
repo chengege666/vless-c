@@ -95,35 +95,7 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 分享链接默认填监听端口，套 CDN 时客户端地址改为优选 IP/域名，端口按上述方式调整。
 
-连端口映射都没有时，直接用下方 Cloudflare Tunnel 方案。
-
-### Cloudflare Tunnel 方案（无端口映射，网页配置）
-
-NAT 机连端口映射都没有（或无公网 IPv4）时，可用 Cloudflare Tunnel 代替端口回源。
-cloudflared 在服务器上主动与 Cloudflare 建立出站连接，无需放行任何入站端口。
-全程在 Cloudflare 网页后台配置，服务器只需执行一次网页生成的安装命令。
-
-前置条件：域名 NS 已托管在 Cloudflare。
-
-配合脚本的步骤：
-
-1. 正常安装 WS+TLS 节点，监听端口选 `2) 自定义端口`（仅本机回源用，填任意空闲端口），证书用 DNS-01（总菜单 `9` → `3`）
-2. 登录 Cloudflare 控制台 → 左侧 **Zero Trust** → **Networks** → **Tunnels** → **Create a tunnel**，类型选 **Cloudflared**，填隧道名（如 `cgg-vless`）
-3. 网页会给出一条安装命令（含 token），复制到服务器执行一次；页面出现 **Connected** 即连接成功
-4. 在同一页面继续 **Public Hostname** → **Add a public hostname**：
-   - Subdomain / Domain：填你的域名（如 `ws.example.com`）
-   - Type：**HTTPS**
-   - URL：`localhost:监听端口`
-   - 展开 **Additional application settings** → **TLS** → 勾选 **No TLS Verify**
-5. 保存即可，DNS 记录由 Cloudflare 自动创建并强制代理
-6. 客户端参数：地址填优选 IP/域名，端口 `443`，SNI/host 填隧道域名，WS 路径不变
-
-提示：
-
-- 安装命令由网页生成且含密钥，仅执行一次；服务已注册 systemd 并开机自启
-- 隧道主机名无需手动开橙色云，也不能关（cfargotunnel 记录强制代理）
-- 防火墙无需放行监听端口，仅出站连接
-- 想省掉证书：手动把 config.json 的 `tlsSettings` 移除（security 改 `none`），网页里 Type 改 **HTTP**、URL `http://localhost:端口`
+连端口映射都没有时，直接用总菜单第 `3` 项的 CF Tunnel 模式（见上文），无需端口映射、无需证书。
 
 ## 修改与卸载
 
