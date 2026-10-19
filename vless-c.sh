@@ -24,6 +24,7 @@ readonly REPO_RAW="${CGG_RAW_BASE:-https://raw.githubusercontent.com/chengege666
 # 子脚本文件名
 readonly SCRIPT_REALITY="cgg-vless-reality.sh"
 readonly SCRIPT_WS="cgg-vless-ws-tls.sh"
+readonly SCRIPT_TUNNEL="cgg-vless-tunnel.sh"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -171,6 +172,8 @@ detect_mode() {
         printf 'reality'
     elif [[ "$sec" == "tls" && "$net" == "ws" ]]; then
         printf 'ws'
+    elif [[ "$sec" == "none" && "$net" == "ws" ]]; then
+        printf 'tunnel'
     else
         printf 'unknown'
     fi
@@ -207,8 +210,8 @@ print_qr() {
 install_reality() {
     local cur
     cur="$(detect_mode)"
-    if [[ "$cur" == "ws" ]]; then
-        warn "当前为 VLESS + WS + TLS 模式，继续安装 Reality 会覆盖现有配置"
+    if [[ "$cur" == "ws" || "$cur" == "tunnel" ]]; then
+        warn "当前为 ${cur} 模式，继续安装 Reality 会覆盖现有配置"
         local ans
         read -r -p "确认覆盖？[y/N]：" ans
         case "$ans" in
@@ -232,6 +235,48 @@ install_ws() {
         esac
     fi
     run_child "$SCRIPT_WS"
+}
+
+install_tunnel() {
+    local cur
+    cur="$(detect_mode)"
+    if [[ "$cur" != "none" && "$cur" != "unknown" ]]; then
+        warn "当前为 ${cur} 模式，继续安装 CF Tunnel 会覆盖现有配置"
+        local ans
+        read -r -p "确认覆盖？[y/N]：" ans
+        case "$ans" in
+            [Yy]*) ;;
+            *) warn "已取消"; return 1 ;;
+        esac
+    fi
+    run_child "$SCRIPT_TUNNEL"
+}
+
+# ------------------------------ 元信息文件读写 --------------------------------
+# 读取 INFO_FILE 中指定键的值（键不存在时输出为空）
+read_info_value() {
+    local key="$1"
+    [[ -f "$INFO_FILE" ]] || return 1
+    sed -n "s/^${key}=//p" "$INFO_FILE" | head -n 1
+}
+
+# 更新 INFO_FILE 中指定键的值（文件或键不存在时追加）
+update_info_value() {
+    local key="$1" value="$2"
+    if [[ ! -f "$INFO_FILE" ]]; then
+        install -d -m 755 -o root -g root "$CONFIG_DIR"
+        printf '%s=%s\n' "$key" "$value" > "$INFO_FILE"
+        chmod 600 "$INFO_FILE"
+        return 0
+    fi
+    if grep -q "^${key}=" "$INFO_FILE"; then
+        # 转义分隔符 | 与替换特殊符 &，避免破坏 sed 表达式
+        value="${value//|/\\|}"
+        value="${value//&/\\&}"
+        sed -i "s|^${key}=.*|${key}=${value}|" "$INFO_FILE"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$INFO_FILE"
+    fi
 }
 
 # ------------------------------ 查看节点信息 ----------------------------------
@@ -339,8 +384,63 @@ show_info_ws() {
     printf '  WS 路径     : %s\n' "$path"
     printf '  SNI         : %s\n' "$domain"
     printf '%s===================================================%s\n\n' "$C_CYAN" "$C_RESET"
-    printf '%sCDN 场景：客户端地址可改为优选 IP/域名，建议端口 443 或 2053/2083/2087/2096。%s\n\n' \
-        "$C_YELLOW" "$C_RESET"
+    printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
+    print_qr "$link"
+}
+
+# 隧道模式（VLESS + WS + CF Tunnel）节点信息
+show_info_tunnel() {
+    local port uuid path domain link node_name ttype latest enc_path
+    port="$(jq -r '.inbounds[0].port // empty' "$CONFIG_FILE")"
+    uuid="$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$CONFIG_FILE")"
+    path="$(jq -r '.inbounds[0].streamSettings.wsSettings.path // empty' "$CONFIG_FILE")"
+
+    if [[ -z "$port" || -z "$uuid" || -z "$path" ]]; then
+        err "配置读取不完整，无法生成链接"
+        return 1
+    fi
+
+    ttype="$(read_info_value TUNNEL_TYPE || true)"
+    node_name="$(read_info_value NODE_NAME || true)"
+    [[ -n "$node_name" ]] || node_name="cgg-vless-tunnel"
+    domain="$(read_info_value TUNNEL_DOMAIN || true)"
+
+    # 临时隧道重启后域名会变化，优先读取服务日志中的最新域名
+    if [[ "$ttype" == "quick" ]]; then
+        latest="$(journalctl -u cgg-quick-tunnel --no-pager -n 200 2>/dev/null \
+            | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
+        if [[ -n "$latest" && "${latest#https://}" != "$domain" ]]; then
+            domain="${latest#https://}"
+            update_info_value TUNNEL_DOMAIN "$domain"
+            warn "临时隧道域名已更新，客户端请重新获取"
+        fi
+    fi
+
+    if [[ -z "$domain" ]]; then
+        warn "尚未记录隧道域名，请在 Cloudflare 网页端完成 Public Hostname 配置"
+        domain="YOUR_TUNNEL_DOMAIN"
+    fi
+
+    enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
+    link="vless://${uuid}@${domain}:443?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#${node_name}"
+
+    printf '\n%s============ cgg-vless WS + CF Tunnel 节点 ============%s\n' "$C_CYAN" "$C_RESET"
+    printf '  模式        : VLESS + WebSocket + CF Tunnel\n'
+    printf '  隧道类型    : %s\n' "$([[ "$ttype" == "quick" ]] && printf '临时隧道（trycloudflare）' || printf '固定隧道')"
+    printf '  节点名称    : %s\n' "$node_name"
+    printf '  隧道域名    : %s\n' "$domain"
+    printf '  端口        : 443（TLS 由 Cloudflare 边缘处理）\n'
+    printf '  UUID        : %s\n' "$uuid"
+    printf '  WS 路径     : %s\n' "$path"
+    printf '  本地回源    : 127.0.0.1:%s\n' "$port"
+    printf '  SNI         : %s\n' "$domain"
+    printf '%s======================================================%s\n\n' "$C_CYAN" "$C_RESET"
+
+    if [[ "$ttype" == "quick" ]]; then
+        printf '%s临时隧道：域名每次重启都会变化，重新查看可获取最新域名；仅建议测试使用。%s\n\n' "$C_YELLOW" "$C_RESET"
+    else
+        printf '%s固定隧道：网页端 Public Hostname 需指向 http://localhost:%s%s\n\n' "$C_YELLOW" "$port" "$C_RESET"
+    fi
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
     print_qr "$link"
@@ -374,8 +474,11 @@ show_info() {
         ws)
             show_info_ws
             ;;
+        tunnel)
+            show_info_tunnel
+            ;;
         unknown)
-            err "无法识别当前配置模式（仅支持 Reality / WS+TLS）"
+            err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel）"
             return 1
             ;;
         *)
@@ -402,6 +505,14 @@ service_action() {
 
     systemctl "$action" xray || { err "systemctl ${action} xray 失败"; return 1; }
     sleep 1
+
+    # Cloudflare Tunnel 服务联动（固定：cloudflared；临时：cgg-quick-tunnel）
+    local tsvc
+    for tsvc in cloudflared cgg-quick-tunnel; do
+        if systemctl cat "$tsvc" >/dev/null 2>&1; then
+            systemctl "$action" "$tsvc" >/dev/null 2>&1 || warn "systemctl ${action} ${tsvc} 失败"
+        fi
+    done
 
     if [[ "$action" == "stop" ]]; then
         log "Xray 已停止"
@@ -546,6 +657,10 @@ change_node_name() {
             current="$(read_info_value NODE_NAME || true)"
             [[ -n "$current" ]] || current="cgg-vless-ws"
             ;;
+        tunnel)
+            current="$(read_info_value NODE_NAME || true)"
+            [[ -n "$current" ]] || current="cgg-vless-tunnel"
+            ;;
         *)
             err "未找到有效配置，请先执行安装"
             return 1
@@ -558,7 +673,7 @@ change_node_name() {
     input="${input// /_}"
     [[ -n "$input" ]] || { warn "输入为空，已取消"; return 1; }
 
-    update_info_node_name "$input"
+    update_info_value NODE_NAME "$input"
     log "节点名称已更新为：${input}"
 
     # 名称仅影响分享链接备注，无需重启服务
@@ -567,6 +682,8 @@ change_node_name() {
         if load_reality; then
             show_info_reality
         fi
+    elif [[ "$mode" == "tunnel" ]]; then
+        show_info_tunnel
     else
         show_info_ws
     fi
@@ -576,7 +693,7 @@ modify_menu() {
     local mode choice
     mode="$(detect_mode)"
 
-    if [[ "$mode" != "reality" && "$mode" != "ws" ]]; then
+    if [[ "$mode" != "reality" && "$mode" != "ws" && "$mode" != "tunnel" ]]; then
         err "未找到有效配置，请先执行安装"
         return 1
     fi
@@ -880,7 +997,7 @@ cert_menu() {
 # ------------------------------ 彻底卸载 --------------------------------------
 uninstall_all() {
     local ans
-    warn "即将删除：Xray 核心、配置文件、日志、systemd 服务"
+    warn "即将删除：Xray 核心、配置文件、日志、systemd 服务、Cloudflare Tunnel 服务"
     read -r -p "确认彻底卸载？该操作不可恢复 [yes/N]：" ans
     if [[ "$ans" != "yes" ]]; then
         warn "已取消"
@@ -893,6 +1010,29 @@ uninstall_all() {
     rm -rf /etc/systemd/system/xray.service.d
     systemctl daemon-reload
     systemctl reset-failed >/dev/null 2>&1 || true
+
+    # 清理 Cloudflare Tunnel 服务（固定：cloudflared；临时：cgg-quick-tunnel）
+    local tsvc tremoved=""
+    for tsvc in cloudflared cgg-quick-tunnel; do
+        if systemctl cat "$tsvc" >/dev/null 2>&1; then
+            systemctl stop "$tsvc" >/dev/null 2>&1 || true
+            systemctl disable "$tsvc" >/dev/null 2>&1 || true
+            rm -f "/etc/systemd/system/${tsvc}.service"
+            tremoved="1"
+        fi
+    done
+    if [[ -n "$tremoved" ]]; then
+        systemctl daemon-reload
+        log "已删除 Cloudflare Tunnel 服务"
+    fi
+    if [[ -x /usr/local/bin/cloudflared ]]; then
+        local dans
+        read -r -p "是否同时删除 cloudflared 主程序？[y/N]：" dans
+        case "$dans" in
+            [Yy]*) rm -f /usr/local/bin/cloudflared; log "已删除 cloudflared 主程序" ;;
+            *) warn "已保留 cloudflared 主程序" ;;
+        esac
+    fi
 
     rm -rf "$CONFIG_DIR" "$LOG_DIR" /usr/local/share/xray
     rm -f "$XRAY_BIN"
@@ -913,6 +1053,7 @@ show_menu() {
     case "$mode" in
         reality) mode_desc="${C_GREEN}VLESS + Reality${C_RESET}" ;;
         ws)      mode_desc="${C_GREEN}VLESS + WS + TLS${C_RESET}" ;;
+        tunnel)  mode_desc="${C_GREEN}VLESS + WS + CF Tunnel${C_RESET}" ;;
         none)    mode_desc="${C_YELLOW}未安装${C_RESET}" ;;
         *)       mode_desc="${C_YELLOW}未知${C_RESET}" ;;
     esac
@@ -921,13 +1062,14 @@ show_menu() {
     printf '  当前模式：%b\n' "$mode_desc"
     printf '  1) 安装 VLESS-Reality 节点\n'
     printf '  2) 安装 VLESS + WS + TLS 节点（CDN）\n'
-    printf '  3) 查看当前节点配置与连接链接\n'
-    printf '  4) 启动 Xray 服务\n'
-    printf '  5) 停止 Xray 服务\n'
-    printf '  6) 重启 Xray 服务\n'
-    printf '  7) 修改配置（节点名称 / SNI / UUID）\n'
-    printf '  8) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
-    printf '  9) 一键彻底卸载\n'
+    printf '  3) 安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）\n'
+    printf '  4) 查看当前节点配置与连接链接\n'
+    printf '  5) 启动 Xray 服务\n'
+    printf '  6) 停止 Xray 服务\n'
+    printf '  7) 重启 Xray 服务\n'
+    printf '  8) 修改配置（节点名称 / SNI / UUID）\n'
+    printf '  9) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
+    printf '  10) 一键彻底卸载\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -941,20 +1083,21 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-9]：" choice; then
+        if ! read -r -p "请选择 [0-10]：" choice; then
             printf '\n'
             return 0
         fi
         case "$choice" in
             1) install_reality || true ;;
             2) install_ws || true ;;
-            3) show_info || true ;;
-            4) service_action start || true ;;
-            5) service_action stop || true ;;
-            6) service_action restart || true ;;
-            7) modify_menu || true ;;
-            8) cert_menu ;;
-            9) uninstall_all || true ;;
+            3) install_tunnel || true ;;
+            4) show_info || true ;;
+            5) service_action start || true ;;
+            6) service_action stop || true ;;
+            7) service_action restart || true ;;
+            8) modify_menu || true ;;
+            9) cert_menu ;;
+            10) uninstall_all || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
