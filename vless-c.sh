@@ -1063,17 +1063,28 @@ apply_sysctl_file() {
         fi
         key="${line%%=*}"
         val="${line#*=}"
+        local lower got
         if out="$(sysctl -w "${key}=${val}" 2>&1)"; then
-            ok=$((ok+1))
-        elif [[ "$out" == *"Permission denied"* || "$out" == *"Read-only"* || "$out" == *"Operation not permitted"* ]]; then
-            fail_perm=$((fail_perm+1))
-            warn "容器限制：${key} 写入被拒（重启无效，需服务商处理）"
-        elif [[ "$out" == *"Invalid argument"* || "$out" == *"No such file"* ]]; then
-            fail_arg=$((fail_arg+1))
-            warn "内核不支持：${key}，已跳过"
+            # 回读校验：部分容器会假成功（写入被静默丢弃但返回 0）
+            got="$(sysctl -n "$key" 2>/dev/null || true)"
+            if [[ "$got" == "$val" ]]; then
+                ok=$((ok+1))
+            else
+                fail_perm=$((fail_perm+1))
+                warn "静默拦截：${key} 写入返回成功但值未变（容器宿主限制，重启无效）"
+            fi
         else
-            fail_other=$((fail_other+1))
-            warn "应用失败：${key}（${out}）"
+            lower="${out,,}"
+            if [[ "$lower" == *"permission denied"* || "$lower" == *"read-only"* || "$lower" == *"operation not permitted"* ]]; then
+                fail_perm=$((fail_perm+1))
+                warn "容器限制：${key} 写入被拒（重启无效，需服务商处理）"
+            elif [[ "$lower" == *"invalid argument"* || "$lower" == *"no such file"* ]]; then
+                fail_arg=$((fail_arg+1))
+                warn "内核不支持：${key}，已跳过"
+            else
+                fail_other=$((fail_other+1))
+                warn "应用失败：${key}（${out}）"
+            fi
         fi
     done < "$conf"
     APPLY_OK="$ok"
