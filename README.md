@@ -49,7 +49,7 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 | 配置方式 | 网页创建隧道取 Token → 脚本注册服务 → 网页添加 Public Hostname | 脚本全自动 |
 | 用途 | 长期使用 | 临时测试 |
 
-固定隧道网页端配置：**Zero Trust → Networks → Tunnels → Public Hostname**，Type 选 **HTTP**，URL 填 `localhost:本地端口`（默认 8001），保存后 DNS 记录自动创建。
+固定隧道网页端配置：**Zero Trust → Networks → Tunnels → Public Hostname**，Type 选 **HTTP**，URL 填 `http://localhost:本地端口`（默认 8001，必须带 `http://` 协议头），保存后 DNS 记录自动创建。
 
 临时隧道域名重启后会变化，用总菜单第 `4` 项重新查看即可获取最新域名；仅建议测试使用。
 
@@ -123,7 +123,7 @@ cloudflared 在服务器上主动与 Cloudflare 建立出站连接，无需放�
 - 安装命令由网页生成且含密钥，仅执行一次；服务已注册 systemd 并开机自启
 - 隧道主机名无需手动开橙色云，也不能关（cfargotunnel 记录强制代理）
 - 防火墙无需放行监听端口，仅出站连接
-- 想省掉证书：手动把 config.json 的 `tlsSettings` 移除（security 改 `none`），网页里 Type 改 **HTTP**、URL `localhost:端口`
+- 想省掉证书：手动把 config.json 的 `tlsSettings` 移除（security 改 `none`），网页里 Type 改 **HTTP**、URL `http://localhost:端口`
 
 ## 修改与卸载
 

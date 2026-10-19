@@ -460,7 +460,7 @@ setup_fixed_tunnel() {
     printf '  Public Hostname → Add a public hostname\n'
     printf '    Subdomain / Domain : 你的域名\n'
     printf '    Type               : HTTP\n'
-    printf '    URL                : localhost:%s\n' "$LOCAL_PORT"
+    printf '    URL                : http://localhost:%s\n' "$LOCAL_PORT"
     printf '%s保存后 DNS 记录自动创建并强制代理。%s\n' "$C_YELLOW" "$C_RESET"
 
     if [[ -t 0 ]]; then
@@ -552,7 +552,7 @@ print_result() {
     if [[ "$TUNNEL_TYPE" == "quick" ]]; then
         printf '%s临时隧道：域名每次重启都会变化，总菜单 4 重新查看可获取最新域名；仅建议测试使用。%s\n' "$C_YELLOW" "$C_RESET"
     else
-        printf '%s固定隧道：如尚未在网页端配置，请按上方提示添加 Public Hostname（Type: HTTP → localhost:%s）。%s\n' "$C_YELLOW" "$LOCAL_PORT" "$C_RESET"
+        printf '%s固定隧道：如尚未在网页端配置，请按上方提示添加 Public Hostname（Type: HTTP → URL: http://localhost:%s，需带 http:// 协议头）。%s\n' "$C_YELLOW" "$LOCAL_PORT" "$C_RESET"
     fi
     printf '%s防火墙无需放行任何入站端口，Xray 仅监听 127.0.0.1。%s\n\n' "$C_YELLOW" "$C_RESET"
 
