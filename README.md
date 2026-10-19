@@ -66,8 +66,9 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 | `/etc/systemd/system/xray.service` | systemd 服务 |
 | `/usr/local/bin/cloudflared` | Cloudflare Tunnel 客户端（隧道模式） |
 | `/etc/systemd/system/cgg-quick-tunnel.service` | 临时隧道服务（隧道模式） |
-| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 11 项） |
-| `/etc/sysctl.d/99-cgg-vless-netopt.conf` | BBR 与 TCP 窗口调优参数（总菜单第 11 项） |
+| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 12 项） |
+| `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 12 项） |
+| `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 11 项） |
 | `/opt/cgg-vless/` | 总菜单下载的子脚本缓存 |
 | `/root/.acme.sh/` | acme.sh 及自动续期任务 |
 
