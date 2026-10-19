@@ -1049,6 +1049,38 @@ uninstall_all() {
 # ------------------------------ TCP 窗口调优 ----------------------------------
 readonly NETOPT_CONF="/etc/sysctl.d/99-cgg-vless-tcp.conf"
 
+# 逐条应用 sysctl 配置文件，精确区分成功 / 容器限制 / 内核不支持
+# 结果写入全局变量 APPLY_OK / APPLY_FAIL / APPLY_FAIL_PERM
+APPLY_OK=0
+APPLY_FAIL=0
+APPLY_FAIL_PERM=0
+apply_sysctl_file() {
+    local conf="$1" line key val out
+    local ok=0 fail_perm=0 fail_arg=0 fail_other=0
+    while IFS= read -r line; do
+        if [[ -z "$line" || "$line" == \#* ]]; then
+            continue
+        fi
+        key="${line%%=*}"
+        val="${line#*=}"
+        if out="$(sysctl -w "${key}=${val}" 2>&1)"; then
+            ok=$((ok+1))
+        elif [[ "$out" == *"Permission denied"* || "$out" == *"Read-only"* || "$out" == *"Operation not permitted"* ]]; then
+            fail_perm=$((fail_perm+1))
+            warn "容器限制：${key} 写入被拒（重启无效，需服务商处理）"
+        elif [[ "$out" == *"Invalid argument"* || "$out" == *"No such file"* ]]; then
+            fail_arg=$((fail_arg+1))
+            warn "内核不支持：${key}，已跳过"
+        else
+            fail_other=$((fail_other+1))
+            warn "应用失败：${key}（${out}）"
+        fi
+    done < "$conf"
+    APPLY_OK="$ok"
+    APPLY_FAIL_PERM="$fail_perm"
+    APPLY_FAIL=$((fail_perm + fail_arg + fail_other))
+}
+
 enable_tcp_tune() {
     command -v sysctl >/dev/null 2>&1 || { err "未找到 sysctl，无法设置内核参数"; return 1; }
 
@@ -1061,22 +1093,21 @@ net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_fastopen=3
 EOF
 
-    if ! sysctl --system >/dev/null 2>&1; then
-        warn "sysctl --system 执行异常（容器可能限制 /proc/sys 写入），参数可能在重启后生效"
-    fi
+    apply_sysctl_file "$NETOPT_CONF"
 
     printf '\n%s-------- TCP 窗口调优状态 --------%s\n' "$C_CYAN" "$C_RESET"
+    printf '  应用结果    : %s 条成功，%s 条失败\n' "$APPLY_OK" "$APPLY_FAIL"
     printf '  接收缓冲上限: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || printf '未知')"
     printf '  发送缓冲上限: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || printf '未知')"
     printf '  TCP FastOpen: %s\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || printf '未知')"
     printf '%s----------------------------------%s\n' "$C_CYAN" "$C_RESET"
 
-    local rmax
-    rmax="$(sysctl -n net.core.rmem_max 2>/dev/null || true)"
-    if [[ "$rmax" == "16777216" ]]; then
-        log "TCP 窗口调优已生效"
+    if (( APPLY_FAIL == 0 )); then
+        log "TCP 窗口调优已全部生效"
+    elif (( APPLY_FAIL_PERM > 0 )); then
+        warn "存在被容器宿主限制的参数，重启也不会生效，请联系服务商放开 /proc/sys 或更换 KVM 机器"
     else
-        warn "参数未立即生效，配置已写入（/proc/sys 只读的容器需联系服务商或重启）"
+        warn "部分参数当前内核不支持已跳过，其余参数已即时生效"
     fi
 }
 
@@ -1113,11 +1144,10 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 
-    if ! sysctl --system >/dev/null 2>&1; then
-        warn "sysctl --system 执行异常（容器可能限制 /proc/sys 写入），参数可能在重启后生效"
-    fi
+    apply_sysctl_file "$BBR_CONF"
 
     printf '\n%s-------- BBR 状态 --------%s\n' "$C_CYAN" "$C_RESET"
+    printf '  应用结果    : %s 条成功，%s 条失败\n' "$APPLY_OK" "$APPLY_FAIL"
     printf '  拥塞控制    : %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
     printf '  队列规则    : %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
     printf '%s--------------------------%s\n' "$C_CYAN" "$C_RESET"
@@ -1126,6 +1156,8 @@ EOF
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     if [[ "$cc" == "bbr" ]]; then
         log "BBR 已生效"
+    elif (( APPLY_FAIL_PERM > 0 )); then
+        warn "BBR 被容器宿主限制，重启也不会生效，请联系服务商放开 /proc/sys 或更换 KVM 机器"
     else
         warn "BBR 未立即生效，配置已写入，重启后自动加载"
     fi
