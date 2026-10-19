@@ -430,12 +430,18 @@ setup_fixed_tunnel() {
     fi
     [[ -n "$CF_TOKEN" ]] || die "Token 不能为空"
 
-    # 重装场景：先清理旧服务再注册，避免 service install 报已存在
-    if systemctl cat cloudflared >/dev/null 2>&1; then
-        systemctl stop cloudflared >/dev/null 2>&1 || true
-        systemctl disable cloudflared >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/cloudflared.service
+    # 重装场景：先清理旧服务与残留文件（含 cloudflared-update.service）再注册，
+    # 否则 service install 会报 "already installed" 而失败
+    if systemctl cat cloudflared >/dev/null 2>&1 || [[ -f /etc/systemd/system/cloudflared-update.service ]]; then
+        warn "检测到旧 cloudflared 服务残留，将先停止并清理（若本机还有其他项目在用 cloudflared 隧道，请先确认）"
+        if [[ -x "$CFDD_BIN" ]]; then
+            "$CFDD_BIN" service uninstall >/dev/null 2>&1 || true
+        fi
+        systemctl stop cloudflared cloudflared-update >/dev/null 2>&1 || true
+        systemctl disable cloudflared cloudflared-update >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/cloudflared.service /etc/systemd/system/cloudflared-update.service
         systemctl daemon-reload
+        log "旧服务清理完成"
     fi
 
     log "注册 cloudflared 服务..."
