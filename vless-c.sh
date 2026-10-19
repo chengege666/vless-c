@@ -1046,6 +1046,52 @@ uninstall_all() {
     log "卸载完成（防火墙放行规则未自动删除，如有需要请手动清理）"
 }
 
+# ------------------------------ BBR 加速与 TCP 窗口调优 -----------------------
+readonly BBR_MODCONF="/etc/modules-load.d/cgg-vless-bbr.conf"
+readonly NETOPT_CONF="/etc/sysctl.d/99-cgg-vless-netopt.conf"
+
+enable_netopt() {
+    command -v modprobe >/dev/null 2>&1 || { err "未找到 modprobe，无法加载内核模块"; return 1; }
+    command -v sysctl >/dev/null 2>&1 || { err "未找到 sysctl，无法设置内核参数"; return 1; }
+
+    if ! modprobe tcp_bbr 2>/dev/null; then
+        err "当前内核不支持 BBR（需 4.9+），已取消"
+        return 1
+    fi
+
+    printf 'tcp_bbr\n' > "$BBR_MODCONF" || { err "无法写入 ${BBR_MODCONF}"; return 1; }
+
+    cat > "$NETOPT_CONF" <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 16384 16777216
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_fastopen=3
+EOF
+
+    sysctl --system >/dev/null 2>&1 || warn "sysctl --system 执行异常，参数可能在重启后生效"
+
+    # 回读校验，输出当前内核状态
+    printf '\n%s-------- 内核网络优化状态 --------%s\n' "$C_CYAN" "$C_RESET"
+    printf '  拥塞控制    : %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
+    printf '  队列规则    : %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
+    printf '  接收窗口上限: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || printf '未知')"
+    printf '  发送窗口上限: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || printf '未知')"
+    printf '  TCP FastOpen: %s\n' "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || printf '未知')"
+    printf '%s----------------------------------%s\n' "$C_CYAN" "$C_RESET"
+
+    local cc
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+    if [[ "$cc" == "bbr" ]]; then
+        log "BBR 与 TCP 窗口调优已生效"
+    else
+        warn "BBR 未立即生效，配置已写入，重启后自动加载"
+    fi
+}
+
 # ------------------------------ 菜单 ------------------------------------------
 show_menu() {
     local mode mode_desc
@@ -1070,6 +1116,7 @@ show_menu() {
     printf '  8) 修改配置（节点名称 / SNI / UUID）\n'
     printf '  9) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
     printf '  10) 一键彻底卸载\n'
+    printf '  11) 开启 BBR 加速与 TCP 窗口调优\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -1083,7 +1130,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-10]：" choice; then
+        if ! read -r -p "请选择 [0-11]：" choice; then
             printf '\n'
             return 0
         fi
@@ -1098,6 +1145,7 @@ main_menu() {
             8) modify_menu || true ;;
             9) cert_menu ;;
             10) uninstall_all || true ;;
+            11) enable_netopt || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
