@@ -26,6 +26,12 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/chengege666/vless-c/main/vless-c.sh)
 ```
 
+短链接
+
+```bash
+bash <(curl -fsSL https://lj.1231818.xyz/vless)
+```
+
 ## 两种模式对比
 
 | 项目 | VLESS + Reality | VLESS + WS + TLS |
