@@ -118,7 +118,7 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 - 总菜单第 `10` 项，输入 `yes` 确认
 - 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务与 `/opt/cgg-vless` 缓存（cloudflared 主程序删除时单独确认）
-- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 9 项
+- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 9 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
 ```bash

@@ -964,6 +964,40 @@ cert_remove() {
     log "已删除证书：${domain}"
 }
 
+# 卸载 acme.sh（含续期任务）
+uninstall_acme() {
+    if [[ ! -x "$ACME_BIN" ]]; then
+        log "未安装 acme.sh，无需卸载"
+        return 0
+    fi
+
+    local ans
+    warn "即将卸载 acme.sh 及其续期任务，已签发证书到期后将无法自动续期"
+    read -r -p "确认卸载 acme.sh？该操作不可恢复 [yes/N]：" ans
+    if [[ "$ans" != "yes" ]]; then
+        warn "已取消"
+        return 1
+    fi
+
+    "$ACME_BIN" --uninstall >/dev/null 2>&1 || warn "acme.sh --uninstall 执行异常，将继续清理残留"
+
+    if [[ -d "$ACME_HOME" ]]; then
+        rm -rf "${ACME_HOME:?}" || warn "删除 ${ACME_HOME} 失败，请手动清理"
+    fi
+
+    # 安全清理可能残留的 cron 续期任务
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v 'acme.sh' | crontab - 2>/dev/null || true
+    fi
+
+    if [[ ! -d "$ACME_HOME" ]]; then
+        log "acme.sh 已卸载（续期任务已移除）"
+        log "已安装到 ${CERT_DIR} 的证书不受影响，如需删除请手动清理"
+    else
+        warn "acme.sh 目录仍存在：${ACME_HOME}，请手动删除"
+    fi
+}
+
 cert_menu() {
     local choice
     while true; do
@@ -975,8 +1009,9 @@ cert_menu() {
         printf '  5) 手动续期\n'
         printf '  6) 安装 / 更新证书到 Xray 目录\n'
         printf '  7) 删除证书\n'
+        printf '  8) 卸载 acme.sh（含续期任务）\n'
         printf '  0) 返回主菜单\n'
-        if ! read -r -p "请选择 [0-7]：" choice; then
+        if ! read -r -p "请选择 [0-8]：" choice; then
             printf '\n'
             return 0
         fi
@@ -988,6 +1023,7 @@ cert_menu() {
             5) cert_renew || true ;;
             6) cert_install_to_xray || true ;;
             7) cert_remove || true ;;
+            8) uninstall_acme || true ;;
             0) return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
