@@ -1371,7 +1371,7 @@ enable_bbr() {
         fi
         if [[ " $available " != *" bbr "* ]]; then
             err "当前内核不支持 BBR（LXC / OpenVZ 容器常见，由宿主内核决定）"
-            warn "仍可使用菜单 11 的 TCP 窗口调优"
+            warn "仍可使用菜单 12 的 TCP 窗口调优"
             return 1
         fi
     fi
@@ -1427,16 +1427,16 @@ show_menu() {
     printf '  1) 安装 VLESS-Reality 节点\n'
     printf '  2) 安装 VLESS + WS + TLS 节点（CDN）\n'
     printf '  3) 安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）\n'
-    printf '  4) 查看当前节点配置与连接链接\n'
-    printf '  5) 启动 Xray 服务\n'
-    printf '  6) 停止 Xray 服务\n'
-    printf '  7) 重启 Xray 服务\n'
-    printf '  8) 修改配置（节点名称 / SNI / UUID）\n'
-    printf '  9) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
-    printf '  10) 一键彻底卸载\n'
-    printf '  11) TCP 窗口调优（无需内核支持）\n'
-    printf '  12) 开启 BBR 加速（需内核支持）\n'
-    printf '  13) 安装 AnyTLS + TLS 节点（sing-box 后端）\n'
+    printf '  4) 安装 AnyTLS + TLS 节点（sing-box 后端）\n'
+    printf '  5) 查看当前节点配置与连接链接\n'
+    printf '  6) 启动 Xray 服务\n'
+    printf '  7) 停止 Xray 服务\n'
+    printf '  8) 重启 Xray 服务\n'
+    printf '  9) 修改配置（节点名称 / SNI / UUID）\n'
+    printf '  10) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
+    printf '  11) 一键彻底卸载\n'
+    printf '  12) TCP 窗口调优（无需内核支持）\n'
+    printf '  13) 开启 BBR 加速（需内核支持）\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -1458,16 +1458,16 @@ main_menu() {
             1) install_reality || true ;;
             2) install_ws || true ;;
             3) install_tunnel || true ;;
-            4) show_info || true ;;
-            5) service_action start || true ;;
-            6) service_action stop || true ;;
-            7) service_action restart || true ;;
-            8) modify_menu || true ;;
-            9) cert_menu ;;
-            10) uninstall_all || true ;;
-            11) enable_tcp_tune || true ;;
-            12) enable_bbr || true ;;
-            13) install_anytls || true ;;
+            4) install_anytls || true ;;
+            5) show_info || true ;;
+            6) service_action start || true ;;
+            7) service_action stop || true ;;
+            8) service_action restart || true ;;
+            9) modify_menu || true ;;
+            10) cert_menu ;;
+            11) uninstall_all || true ;;
+            12) enable_tcp_tune || true ;;
+            13) enable_bbr || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac

@@ -258,7 +258,7 @@ ask_listen_port() {
                 printf '  3) 监听端口 %s 不在 Cloudflare 支持列表，需在 Cloudflare Origin Rules\n' "$LISTEN_PORT"
                 printf '     将回源端口设为 %s，客户端端口填 443\n' "$LISTEN_PORT"
             fi
-            printf '  4) 80 端口不可用申请证书时，改用 DNS-01 验证（总菜单 9 → 3）\n'
+            printf '  4) 80 端口不可用申请证书时，改用 DNS-01 验证（总菜单 10 → 3）\n'
             printf '%s----------------------------------------%s\n' "$C_YELLOW" "$C_RESET"
             ;;
         *)
@@ -368,7 +368,7 @@ issue_cert() {
             err "DNS 查询失败（NXDOMAIN）：域名未解析或记录尚未生效"
         elif grep -qE 'Connection refused|Timeout|timed out' "$log_file" 2>/dev/null; then
             err "80 端口公网不可达：请检查安全组、NAT 端口映射与防火墙"
-            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 9 → 3）"
+            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 10 → 3）"
         elif grep -q 'Invalid response' "$log_file" 2>/dev/null; then
             err "80 端口被其他服务占用或响应异常"
         fi
@@ -462,7 +462,7 @@ use_cert_files() {
 use_installed_cert() {
     local cert="${CERT_DIR}/fullchain.pem" key="${CERT_DIR}/privkey.pem"
     [[ -s "$cert" && -s "$key" ]] \
-        || die "未找到已安装证书，请先在总菜单 9 中申请并安装到 ${CERT_DIR}"
+        || die "未找到已安装证书，请先在总菜单 10 中申请并安装到 ${CERT_DIR}"
     cert_is_valid "$cert" "$key" || die "已安装的证书与私钥不匹配，请重新安装证书"
     fix_cert_perms
     log "使用已安装证书：${CERT_DIR}"
