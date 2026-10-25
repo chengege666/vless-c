@@ -226,6 +226,50 @@ verify_xray_runtime() {
 }
 
 # ------------------------------ 安装 Xray -------------------------------------
+# 直接从 GitHub releases 下载 Xray 二进制（绕过 GitHub API 速率限制 403）
+install_xray_binary() {
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch="64" ;;
+        aarch64) arch="arm64-v8a" ;;
+        armv7l)  arch="arm32-v7a" ;;
+        *) die "不支持的 CPU 架构：$(uname -m)" ;;
+    esac
+
+    local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip"
+    local tmp
+    tmp="$(mktemp -d)"
+
+    log "下载 Xray release 包：${url}"
+    if ! curl -fL --retry 3 --connect-timeout 15 -o "${tmp}/xray.zip" "$url"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if ! command -v unzip >/dev/null 2>&1; then
+        log "安装解压工具 unzip"
+        apt-get update -y >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip >/dev/null 2>&1 || true
+        command -v unzip >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+    fi
+
+    if ! unzip -o "${tmp}/xray.zip" -d "${tmp}/xray" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    [[ -x "${tmp}/xray/xray" ]] || { rm -rf "$tmp"; return 1; }
+
+    install -m 755 "${tmp}/xray/xray" "$XRAY_BIN" || { rm -rf "$tmp"; return 1; }
+
+    # 安装 geoip/geosite 数据（可选，缺失不阻断）
+    install -d -m 755 /usr/local/share/xray
+    [[ -f "${tmp}/xray/geoip.dat" ]] && install -m 644 "${tmp}/xray/geoip.dat" /usr/local/share/xray/ || true
+    [[ -f "${tmp}/xray/geosite.dat" ]] && install -m 644 "${tmp}/xray/geosite.dat" /usr/local/share/xray/ || true
+
+    rm -rf "$tmp"
+    return 0
+}
+
 ensure_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
         log "检测到已安装 Xray：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
@@ -241,9 +285,19 @@ ensure_xray() {
     fi
     bash "$installer" install || rc=$?
     rm -f "$installer"
-    (( rc == 0 )) || die "Xray 安装失败（退出码 ${rc}）"
+
+    if (( rc == 0 )); then
+        [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
+        verify_xray_runtime || die "Xray 安装完成但无法运行，请按上方提示排查"
+        return 0
+    fi
+
+    # 官方安装脚本失败（常见：GitHub API 403 速率限制），回退到直接下载 release 二进制
+    warn "官方安装脚本失败（退出码 ${rc}），尝试直接下载 release 二进制..."
+    install_xray_binary || die "Xray 安装失败（官方脚本与直链下载均失败）"
     [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
     verify_xray_runtime || die "Xray 安装完成但无法运行，请按上方提示排查"
+    log "Xray 安装完成：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
 }
 
 # ------------------------------ 参数生成 --------------------------------------
