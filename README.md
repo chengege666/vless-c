@@ -1,8 +1,8 @@
 # cgg-vless
 
-一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + WS + Cloudflare Tunnel** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
+一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
 
-核心统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议。
+VLESS 系列统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议；AnyTLS 因 Xray-core 不支持，使用独立 sing-box 后端。
 
 ```
   ██████╗ ██████╗  ██████╗     ██╗   ██╗██╗     ███████╗███████╗███████╗
@@ -60,6 +60,22 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 临时隧道域名重启后会变化，用总菜单第 `4` 项重新查看即可获取最新域名；仅建议测试使用。
 
 
+## AnyTLS + TLS 模式（总菜单第 13 项）
+
+Xray-core 不支持 AnyTLS，该模式由脚本安装 **独立 sing-box 后端**，配置、服务、元信息均与 Xray 分离，可与现有 Reality / WS+TLS / Tunnel 节点并存（仅端口冲突时拦截）。
+
+| 项目 | 说明 |
+|---|---|
+| 是否需要域名 | 需要，用于证书与 SNI |
+| 证书 | 复用 `/usr/local/etc/xray/cert`，或手动填 `.cer` / `.key` 路径 |
+| 默认端口 | 443（可自定义，NAT 机填映射范围内的端口） |
+| 传输 | AnyTLS（原始 TCP + TLS，`fp=chrome`） |
+| 客户端 | sing-box 系客户端直接支持；v2rayN 需切到 sing-box 内核；FlClash 等 mihomo 系需支持 AnyTLS 的版本 |
+| CDN | **不支持**套 Cloudflare CDN（非 HTTP/WS，无法回源） |
+
+安装时会自动生成 32 位十六进制密码，完成后输出 `anytls://` 链接与二维码；NAT 机需在服务商面板把外部端口映射到相同内部端口。
+
+
 ## 输出文件与路径
 
 | 路径 | 内容 |
@@ -72,6 +88,11 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 | `/etc/systemd/system/xray.service` | systemd 服务 |
 | `/usr/local/bin/cloudflared` | Cloudflare Tunnel 客户端（隧道模式） |
 | `/etc/systemd/system/cgg-quick-tunnel.service` | 临时隧道服务（隧道模式） |
+| `/usr/local/bin/sing-box` | sing-box 核心（AnyTLS 模式） |
+| `/usr/local/etc/sing-box/config.json` | AnyTLS 节点配置（AnyTLS 模式） |
+| `/usr/local/etc/sing-box/cgg-anytls.info` | AnyTLS 元信息（含密码，权限 600） |
+| `/usr/local/etc/sing-box/cert/` | AnyTLS 手动证书副本（AnyTLS 模式） |
+| `/etc/systemd/system/cgg-anytls.service` | AnyTLS 服务（AnyTLS 模式） |
 | `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 12 项） |
 | `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 12 项） |
 | `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 11 项） |
@@ -110,14 +131,14 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 修改配置：
 
-- 所有模式均可在总菜单第 `8` 项修改节点名称（仅影响分享链接备注）
+- 所有模式均可在总菜单第 `8` 项修改节点名称（仅影响分享链接备注）；AnyTLS 已安装时该菜单额外提供「修改 AnyTLS 节点名称」
 - Reality：同一菜单可更换 SNI 或重置 UUID
 - WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
 彻底卸载：
 
 - 总菜单第 `10` 项，输入 `yes` 确认
-- 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务与 `/opt/cgg-vless` 缓存（cloudflared 主程序删除时单独确认）
+- 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
 - **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 9 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
