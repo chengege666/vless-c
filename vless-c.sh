@@ -11,11 +11,19 @@ set -euo pipefail
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
-readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
-readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
+
+# 三种模式的实例名（与子脚本中 config-<mode>.json / xray@<mode> 对应）
+readonly MODE_REALITY="reality"
+readonly MODE_WS="wstls"
+readonly MODE_TUNNEL="tunnel"
+
+# 运行期变量：当前操作的模式上下文，由 set_mode_context 设置
+CURRENT_MODE=""
+CONFIG_FILE=""
+INFO_FILE=""
+SERVICE_NAME=""
 readonly CACHE_DIR="/opt/cgg-vless"
 readonly ACME_HOME="/root/.acme.sh"
 readonly ACME_BIN="${ACME_HOME}/acme.sh"
@@ -156,22 +164,67 @@ run_child() {
 }
 
 # ------------------------------ 模式检测 --------------------------------------
-# 输出 reality / ws / unknown / none
+# 设置当前操作的模式上下文（CONFIG_FILE / INFO_FILE / SERVICE_NAME / CURRENT_MODE）
+set_mode_context() {
+    local mode="$1"
+    case "$mode" in
+        reality)
+            CURRENT_MODE="reality"
+            CONFIG_FILE="${CONFIG_DIR}/config-reality.json"
+            INFO_FILE="${CONFIG_DIR}/cgg-reality.info"
+            SERVICE_NAME="xray@reality"
+            ;;
+        wstls)
+            CURRENT_MODE="wstls"
+            CONFIG_FILE="${CONFIG_DIR}/config-wstls.json"
+            INFO_FILE="${CONFIG_DIR}/cgg-wstls.info"
+            SERVICE_NAME="xray@wstls"
+            ;;
+        tunnel)
+            CURRENT_MODE="tunnel"
+            CONFIG_FILE="${CONFIG_DIR}/config-tunnel.json"
+            INFO_FILE="${CONFIG_DIR}/cgg-tunnel.info"
+            SERVICE_NAME="xray@tunnel"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 输出已安装的模式列表（空格分隔），按 reality wstls tunnel 顺序
+detect_installed_modes() {
+    local m f modes=""
+    for m in reality wstls tunnel; do
+        f="${CONFIG_DIR}/config-${m}.json"
+        [[ -f "$f" ]] && modes="${modes} ${m}"
+    done
+    printf '%s' "${modes# }"
+}
+
+# 检测指定配置文件的模式（reality / wstls / tunnel / unknown / none）
+# 不带参数时检测第一个已安装模式，并自动 set_mode_context
 detect_mode() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        printf 'none'
-        return 0
+    local cfg="$1"
+    if [[ -z "$cfg" ]]; then
+        local first
+        first="$(detect_installed_modes | awk '{print $1}')"
+        if [[ -z "$first" ]]; then
+            printf 'none'
+            return 0
+        fi
+        set_mode_context "$first"
+        cfg="$CONFIG_FILE"
     fi
+    [[ -f "$cfg" ]] || { printf 'none'; return 0; }
     command -v jq >/dev/null 2>&1 || { printf 'unknown'; return 0; }
 
     local sec net
-    sec="$(jq -r '.inbounds[0].streamSettings.security // empty' "$CONFIG_FILE" 2>/dev/null || true)"
-    net="$(jq -r '.inbounds[0].streamSettings.network // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    sec="$(jq -r '.inbounds[0].streamSettings.security // empty' "$cfg" 2>/dev/null || true)"
+    net="$(jq -r '.inbounds[0].streamSettings.network // empty' "$cfg" 2>/dev/null || true)"
 
     if [[ "$sec" == "reality" ]]; then
         printf 'reality'
     elif [[ "$sec" == "tls" && "$net" == "ws" ]]; then
-        printf 'ws'
+        printf 'wstls'
     elif [[ "$sec" == "none" && "$net" == "ws" ]]; then
         printf 'tunnel'
     else
@@ -207,48 +260,16 @@ print_qr() {
 }
 
 # ------------------------------ 安装入口 --------------------------------------
+# 三种模式可共存，各自写入独立的 config-<mode>.json / xray@<mode>，不再互斥覆盖
 install_reality() {
-    local cur
-    cur="$(detect_mode)"
-    if [[ "$cur" == "ws" || "$cur" == "tunnel" ]]; then
-        warn "当前为 ${cur} 模式，继续安装 Reality 会覆盖现有配置"
-        local ans
-        read -r -p "确认覆盖？[y/N]：" ans
-        case "$ans" in
-            [Yy]*) ;;
-            *) warn "已取消"; return 1 ;;
-        esac
-    fi
     run_child "$SCRIPT_REALITY"
 }
 
 install_ws() {
-    local cur
-    cur="$(detect_mode)"
-    if [[ "$cur" != "none" && "$cur" != "unknown" ]]; then
-        warn "当前为 ${cur} 模式，继续安装 WS+TLS 会覆盖现有配置"
-        local ans
-        read -r -p "确认覆盖？[y/N]：" ans
-        case "$ans" in
-            [Yy]*) ;;
-            *) warn "已取消"; return 1 ;;
-        esac
-    fi
     run_child "$SCRIPT_WS"
 }
 
 install_tunnel() {
-    local cur
-    cur="$(detect_mode)"
-    if [[ "$cur" != "none" && "$cur" != "unknown" ]]; then
-        warn "当前为 ${cur} 模式，继续安装 CF Tunnel 会覆盖现有配置"
-        local ans
-        read -r -p "确认覆盖？[y/N]：" ans
-        case "$ans" in
-            [Yy]*) ;;
-            *) warn "已取消"; return 1 ;;
-        esac
-    fi
     run_child "$SCRIPT_TUNNEL"
 }
 
@@ -447,63 +468,81 @@ show_info_tunnel() {
 }
 
 show_info() {
-    if command -v jq >/dev/null 2>&1; then
-        :
-    else
+    if ! command -v jq >/dev/null 2>&1; then
         err "缺少 jq，请先安装：apt-get install -y jq"
         return 1
     fi
 
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        err "未找到配置，请先执行安装"
+    local modes
+    modes="$(detect_installed_modes)"
+    if [[ -z "$modes" ]]; then
+        err "未找到任何已安装模式，请先执行安装"
         return 1
     fi
 
     SERVER_IP="$(get_public_ip)"
 
     local mode
-    mode="$(detect_mode)"
-    case "$mode" in
-        reality)
-            if ! load_reality; then
-                err "Reality 配置读取失败，可能配置不完整"
-                return 1
-            fi
-            show_info_reality
-            ;;
-        ws)
-            show_info_ws
-            ;;
-        tunnel)
-            show_info_tunnel
-            ;;
-        unknown)
-            err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel）"
-            return 1
-            ;;
-        *)
-            err "未找到有效配置"
-            return 1
-            ;;
-    esac
+    for mode in $modes; do
+        set_mode_context "$mode"
+        case "$mode" in
+            reality)
+                if ! load_reality; then
+                    err "Reality 配置读取失败，可能配置不完整"
+                    continue
+                fi
+                show_info_reality
+                ;;
+            wstls)
+                show_info_ws
+                ;;
+            tunnel)
+                show_info_tunnel
+                ;;
+            *)
+                err "无法识别配置模式：${mode}"
+                continue
+                ;;
+        esac
+    done
 
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        log "服务状态：运行中"
-    else
-        warn "服务状态：未运行"
-    fi
-    printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$CONFIG_FILE" "$C_RESET"
+    # 汇总各实例运行状态
+    local svc state
+    printf '%s-------- 服务运行状态 --------%s\n' "$C_CYAN" "$C_RESET"
+    for mode in $modes; do
+        set_mode_context "$mode"
+        svc="$SERVICE_NAME"
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            state="${C_GREEN}运行中${C_RESET}"
+        else
+            state="${C_RED}未运行${C_RESET}"
+        fi
+        printf '  %-18s %s\n' "$svc" "$state"
+    done
+    printf '%s------------------------------%s\n\n' "$C_CYAN" "$C_RESET"
 }
 
 # ------------------------------ 服务控制 --------------------------------------
+# 对所有已安装的 xray@<mode> 实例执行启停重启
 service_action() {
     local action="$1"
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        err "未找到 systemd 服务，请先执行安装"
+    local modes
+    modes="$(detect_installed_modes)"
+    if [[ -z "$modes" ]]; then
+        err "未找到已安装的 Xray 实例，请先执行安装"
         return 1
     fi
 
-    systemctl "$action" xray || { err "systemctl ${action} xray 失败"; return 1; }
+    local mode ok=1
+    for mode in $modes; do
+        set_mode_context "$mode"
+        if systemctl "$action" "$SERVICE_NAME" 2>/dev/null; then
+            log "${SERVICE_NAME} ${action} 成功"
+        else
+            warn "${SERVICE_NAME} ${action} 失败"
+            ok=0
+        fi
+    done
     sleep 1
 
     # Cloudflare Tunnel 服务联动（固定：cloudflared；临时：cgg-quick-tunnel）
@@ -515,14 +554,23 @@ service_action() {
     done
 
     if [[ "$action" == "stop" ]]; then
-        log "Xray 已停止"
+        log "所有 Xray 实例已停止"
         return 0
     fi
 
-    if systemctl is-active --quiet xray; then
-        log "Xray 已${action}完成，当前状态：运行中"
+    # 检查所有实例是否处于运行状态
+    local running=0 total=0
+    for mode in $modes; do
+        set_mode_context "$mode"
+        total=$((total + 1))
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            running=$((running + 1))
+        fi
+    done
+    if (( running == total )); then
+        log "所有 Xray 实例已${action}完成（${running}/${total} 运行中）"
     else
-        err "Xray ${action} 后未处于运行状态，请查看日志"
+        err "部分实例 ${action} 后未运行（${running}/${total}），请查看日志"
         return 1
     fi
 }
@@ -545,20 +593,21 @@ restart_after_change() {
     read -r -p "配置已更新，是否立即重启 Xray 生效？[Y/n]：" ans
     case "$ans" in
         [Nn]*)
-            warn "已跳过重启，请稍后手动执行：systemctl restart xray"
+            warn "已跳过重启，请稍后手动执行：systemctl restart ${SERVICE_NAME}"
             ;;
         *)
             systemctl daemon-reload
-            if systemctl restart xray && sleep 1 && systemctl is-active --quiet xray; then
-                log "Xray 已重启生效"
+            if systemctl restart "$SERVICE_NAME" && sleep 1 && systemctl is-active --quiet "$SERVICE_NAME"; then
+                log "${SERVICE_NAME} 已重启生效"
             else
-                err "Xray 重启失败，可使用备份配置回滚"
+                err "${SERVICE_NAME} 重启失败，可使用备份配置回滚"
             fi
             ;;
     esac
 }
 
 change_sni() {
+    set_mode_context reality
     if ! load_reality; then
         err "Reality 配置读取失败，请先执行安装"
         return 1
@@ -600,6 +649,7 @@ change_sni() {
 }
 
 reset_uuid() {
+    set_mode_context reality
     if ! load_reality; then
         err "Reality 配置读取失败，请先执行安装"
         return 1
@@ -640,12 +690,10 @@ reset_uuid() {
     restart_after_change
 }
 
-# 修改节点名称（Reality / WS 均可用）
+# 修改节点名称（依赖调用方已 set_mode_context）
 change_node_name() {
-    local mode current input
-    mode="$(detect_mode)"
-
-    case "$mode" in
+    local current input
+    case "$CURRENT_MODE" in
         reality)
             if ! load_reality; then
                 err "Reality 配置读取失败，请先执行安装"
@@ -653,7 +701,7 @@ change_node_name() {
             fi
             current="$R_NODE_NAME"
             ;;
-        ws)
+        wstls)
             current="$(read_info_value NODE_NAME || true)"
             [[ -n "$current" ]] || current="cgg-vless-ws"
             ;;
@@ -662,7 +710,7 @@ change_node_name() {
             [[ -n "$current" ]] || current="cgg-vless-tunnel"
             ;;
         *)
-            err "未找到有效配置，请先执行安装"
+            err "未选择有效模式"
             return 1
             ;;
     esac
@@ -678,25 +726,42 @@ change_node_name() {
 
     # 名称仅影响分享链接备注，无需重启服务
     SERVER_IP="$(get_public_ip)"
-    if [[ "$mode" == "reality" ]]; then
-        if load_reality; then
-            show_info_reality
-        fi
-    elif [[ "$mode" == "tunnel" ]]; then
-        show_info_tunnel
-    else
-        show_info_ws
-    fi
+    case "$CURRENT_MODE" in
+        reality) load_reality && show_info_reality ;;
+        wstls)   show_info_ws ;;
+        tunnel)  show_info_tunnel ;;
+    esac
 }
 
 modify_menu() {
-    local mode choice
-    mode="$(detect_mode)"
-
-    if [[ "$mode" != "reality" && "$mode" != "ws" && "$mode" != "tunnel" ]]; then
-        err "未找到有效配置，请先执行安装"
+    local modes mode choice
+    modes="$(detect_installed_modes)"
+    if [[ -z "$modes" ]]; then
+        err "未找到已安装模式，请先执行安装"
         return 1
     fi
+
+    # 单实例直接进入；多实例让用户选择
+    if [[ "$(printf '%s\n' $modes | wc -l)" -eq 1 ]]; then
+        mode="$modes"
+    else
+        printf '\n%s-------- 选择要修改的模式 --------%s\n' "$C_CYAN" "$C_RESET"
+        local i=1 m
+        for m in $modes; do
+            printf '  %s) %s\n' "$i" "$m"
+            i=$((i + 1))
+        done
+        printf '  0) 返回主菜单\n'
+        if ! read -r -p "请选择：" choice; then
+            printf '\n'
+            return 0
+        fi
+        [[ "$choice" == "0" ]] && return 0
+        mode="$(printf '%s\n' $modes | sed -n "${choice}p")"
+        [[ -z "$mode" ]] && { warn "无效选项"; return 1; }
+    fi
+
+    set_mode_context "$mode"
 
     while true; do
         printf '\n%s-------- 修改配置（当前模式：%s）--------%s\n' "$C_CYAN" "$mode" "$C_RESET"
@@ -716,7 +781,7 @@ modify_menu() {
                 if [[ "$mode" == "reality" ]]; then
                     change_sni || true
                 else
-                    warn "WS+TLS 模式不支持修改 SNI"
+                    warn "当前模式不支持修改 SNI"
                 fi
                 ;;
             3)
@@ -914,7 +979,7 @@ cert_install_to_xray() {
 
     install -d -m 750 -o root -g "$group" "$CERT_DIR" || { err "无法创建证书目录：${CERT_DIR}"; return 1; }
 
-    reload="chown root:${group} ${CERT_DIR}/privkey.pem ${CERT_DIR}/fullchain.pem 2>/dev/null; chmod 640 ${CERT_DIR}/privkey.pem; chmod 644 ${CERT_DIR}/fullchain.pem; systemctl restart xray 2>/dev/null || true"
+    reload="chown root:${group} ${CERT_DIR}/privkey.pem ${CERT_DIR}/fullchain.pem 2>/dev/null; chmod 640 ${CERT_DIR}/privkey.pem; chmod 644 ${CERT_DIR}/fullchain.pem; systemctl restart xray@wstls 2>/dev/null || true"
 
     if acme_is_ecc "$domain"; then
         "$ACME_BIN" --install-cert -d "$domain" --ecc \
@@ -1004,9 +1069,18 @@ uninstall_all() {
         return 1
     fi
 
+    # 停止并禁用所有已安装的 xray@<mode> 实例
+    local mode
+    for mode in $(detect_installed_modes); do
+        set_mode_context "$mode"
+        systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+    done
+    # 清理旧版单实例服务（兼容历史安装）
     systemctl stop xray >/dev/null 2>&1 || true
     systemctl disable xray >/dev/null 2>&1 || true
-    rm -f "$SERVICE_FILE"
+    rm -f /etc/systemd/system/xray.service
     rm -rf /etc/systemd/system/xray.service.d
     systemctl daemon-reload
     systemctl reset-failed >/dev/null 2>&1 || true
@@ -1176,18 +1250,22 @@ EOF
 
 # ------------------------------ 菜单 ------------------------------------------
 show_menu() {
-    local mode mode_desc
-    mode="$(detect_mode)"
-    case "$mode" in
-        reality) mode_desc="${C_GREEN}VLESS + Reality${C_RESET}" ;;
-        ws)      mode_desc="${C_GREEN}VLESS + WS + TLS${C_RESET}" ;;
-        tunnel)  mode_desc="${C_GREEN}VLESS + WS + CF Tunnel${C_RESET}" ;;
-        none)    mode_desc="${C_YELLOW}未安装${C_RESET}" ;;
-        *)       mode_desc="${C_YELLOW}未知${C_RESET}" ;;
-    esac
+    local modes mode_desc="" m
+    modes="$(detect_installed_modes)"
+    if [[ -z "$modes" ]]; then
+        mode_desc="${C_YELLOW}未安装${C_RESET}"
+    else
+        for m in $modes; do
+            case "$m" in
+                reality) mode_desc="${mode_desc}${C_GREEN}Reality${C_RESET} " ;;
+                wstls)   mode_desc="${mode_desc}${C_GREEN}WS+TLS${C_RESET} " ;;
+                tunnel)  mode_desc="${mode_desc}${C_GREEN}Tunnel${C_RESET} " ;;
+            esac
+        done
+    fi
 
     printf '%s==================== cgg-vless 总菜单 ====================%s\n' "$C_MAGENTA" "$C_RESET"
-    printf '  当前模式：%b\n' "$mode_desc"
+    printf '  已安装模式：%b\n' "$mode_desc"
     printf '  1) 安装 VLESS-Reality 节点\n'
     printf '  2) 安装 VLESS + WS + TLS 节点（CDN）\n'
     printf '  3) 安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）\n'

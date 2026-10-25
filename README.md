@@ -65,11 +65,17 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 | 路径 | 内容 |
 |---|---|
 | `/usr/local/bin/xray` | Xray 核心 |
-| `/usr/local/etc/xray/config.json` | 节点配置 |
-| `/usr/local/etc/xray/cgg-vless.info` | 节点元信息（各模式共用，权限 600） |
+| `/usr/local/etc/xray/config-reality.json` | Reality 模式配置 |
+| `/usr/local/etc/xray/cgg-reality.info` | Reality 元信息（权限 600） |
+| `/usr/local/etc/xray/config-wstls.json` | WS+TLS 模式配置 |
+| `/usr/local/etc/xray/cgg-wstls.info` | WS+TLS 元信息（权限 600） |
+| `/usr/local/etc/xray/config-tunnel.json` | Tunnel 模式配置 |
+| `/usr/local/etc/xray/cgg-tunnel.info` | Tunnel 元信息（权限 600） |
 | `/usr/local/etc/xray/cert/` | WS+TLS 证书目录 |
 | `/var/log/xray/` | 访问日志与错误日志 |
-| `/etc/systemd/system/xray.service` | systemd 服务 |
+| `/etc/systemd/system/xray@reality.service` | Reality systemd 服务 |
+| `/etc/systemd/system/xray@wstls.service` | WS+TLS systemd 服务 |
+| `/etc/systemd/system/xray@tunnel.service` | Tunnel systemd 服务 |
 | `/usr/local/bin/cloudflared` | Cloudflare Tunnel 客户端（隧道模式） |
 | `/etc/systemd/system/cgg-quick-tunnel.service` | 临时隧道服务（隧道模式） |
 | `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 12 项） |
@@ -77,6 +83,8 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 | `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 11 项） |
 | `/opt/cgg-vless/` | 总菜单下载的子脚本缓存 |
 | `/root/.acme.sh/` | acme.sh 及自动续期任务 |
+
+> 三种模式可同时安装，各自使用独立的配置文件与 systemd 实例（`xray@reality` / `xray@wstls` / `xray@tunnel`），互不影响。
 
 
 ## Cloudflare CDN 配置建议
@@ -112,7 +120,7 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 - 所有模式均可在总菜单第 `8` 项修改节点名称（仅影响分享链接备注）
 - Reality：同一菜单可更换 SNI 或重置 UUID
-- WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
+- WS+TLS：域名变更需修改 `/usr/local/etc/xray/config-wstls.json` 后重启 `xray@wstls` 服务
 
 彻底卸载：
 
@@ -141,7 +149,7 @@ iptables -D INPUT -p tcp --dport <端口> -j ACCEPT
 ## 安全提示
 
 - 私钥仅保存在服务端，请勿泄露
-- `cgg-vless.info` 权限为 `600`，仅 root 可读
+- 各模式元信息文件（`cgg-reality.info` / `cgg-wstls.info` / `cgg-tunnel.info`）权限为 `600`，仅 root 可读
 - 本脚本以 root 运行并修改系统服务，请只在自有服务器上使用
 - 建议配置 SSH 密钥登录并限制 root 密码登录
 

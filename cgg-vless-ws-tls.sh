@@ -10,10 +10,10 @@ set -euo pipefail
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
-readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
+readonly CONFIG_FILE="${CONFIG_DIR}/config-wstls.json"
+readonly INFO_FILE="${CONFIG_DIR}/cgg-wstls.info"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
-readonly SERVICE_FILE="/etc/systemd/system/xray.service"
+readonly SERVICE_FILE="/etc/systemd/system/xray@wstls.service"
 readonly LOG_DIR="/var/log/xray"
 readonly ACME_HOME="/root/.acme.sh"
 readonly ACME_BIN="${ACME_HOME}/acme.sh"
@@ -386,7 +386,7 @@ install_cert() {
     if ! "$ACME_BIN" --install-cert -d "$DOMAIN" --ecc \
         --key-file "${CERT_DIR}/privkey.pem" \
         --fullchain-file "${CERT_DIR}/fullchain.pem" \
-        --reloadcmd "chown root:${RUN_GROUP} ${CERT_DIR}/privkey.pem ${CERT_DIR}/fullchain.pem 2>/dev/null; chmod 640 ${CERT_DIR}/privkey.pem; chmod 644 ${CERT_DIR}/fullchain.pem; systemctl restart xray 2>/dev/null || true"; then
+        --reloadcmd "chown root:${RUN_GROUP} ${CERT_DIR}/privkey.pem ${CERT_DIR}/fullchain.pem 2>/dev/null; chmod 640 ${CERT_DIR}/privkey.pem; chmod 644 ${CERT_DIR}/fullchain.pem; systemctl restart xray@wstls 2>/dev/null || true"; then
         die "证书安装到 ${CERT_DIR} 失败"
     fi
 
@@ -512,6 +512,45 @@ gen_ws_path() {
     WS_PATH="/cgg-${rand}"
     [[ ${#WS_PATH} -ge 8 ]] || die "WS 路径生成失败"
     log "WebSocket 路径生成完成：${WS_PATH}"
+}
+
+# ------------------------------ 旧版迁移与端口冲突检测 --------------------------
+# 停止旧版单实例服务（仅处理由本套件写入的 xray.service），并迁移匹配的旧配置
+migrate_legacy() {
+    local old_service="/etc/systemd/system/xray.service"
+    local old_config="${CONFIG_DIR}/config.json"
+    local old_info="${CONFIG_DIR}/cgg-vless.info"
+
+    if [[ -f "$old_service" ]] && grep -q "cgg-vless" "$old_service"; then
+        systemctl stop xray 2>/dev/null || true
+        systemctl disable xray 2>/dev/null || true
+        log "已停止旧版单实例服务 xray"
+    fi
+
+    if [[ -f "$old_config" && ! -f "$CONFIG_FILE" ]]; then
+        local net sec
+        net="$(jq -r '.inbounds[0].network // empty' "$old_config" 2>/dev/null)"
+        sec="$(jq -r '.inbounds[0].security // empty' "$old_config" 2>/dev/null)"
+        if [[ "$net" == "ws" && "$sec" == "tls" ]]; then
+            mv "$old_config" "$CONFIG_FILE"
+            [[ -f "$old_info" ]] && mv "$old_info" "$INFO_FILE"
+            log "已迁移旧版 WS+TLS 配置到实例化路径"
+        fi
+    fi
+}
+
+# 检查其他已安装实例是否占用同一监听端口
+check_port_conflict() {
+    local f p name
+    for f in "${CONFIG_DIR}"/config-*.json; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f")"
+        [[ "$name" == "config-wstls.json" ]] && continue
+        p="$(jq -r '.inbounds[0].port // empty' "$f" 2>/dev/null)"
+        if [[ -n "$p" && "$p" == "$LISTEN_PORT" ]]; then
+            die "端口 ${LISTEN_PORT} 已被 ${name} 占用，请更换端口或先卸载对应模式"
+        fi
+    done
 }
 
 # ------------------------------ 配置写入 --------------------------------------
@@ -658,13 +697,13 @@ EOF
 start_service() {
     log "启用并启动 Xray 服务..."
     systemctl daemon-reload
-    systemctl enable xray >/dev/null 2>&1 || warn "设置开机自启失败"
-    systemctl restart xray || true
+    systemctl enable xray@wstls >/dev/null 2>&1 || warn "设置开机自启失败"
+    systemctl restart xray@wstls || true
     sleep 1
 
-    if ! systemctl is-active --quiet xray; then
+    if ! systemctl is-active --quiet xray@wstls; then
         err "Xray 启动失败，最近日志如下："
-        journalctl -u xray -n 20 --no-pager >&2 || true
+        journalctl -u xray@wstls -n 20 --no-pager >&2 || true
         die "请根据日志排查后重试"
     fi
     log "Xray 已启动，并已设置开机自启"
@@ -766,7 +805,7 @@ print_result() {
 
     printf '%s证书续期：acme.sh 已自动添加 cron 任务，可执行 "%s --cron" 手动检查%s\n' \
         "$C_CYAN" "$ACME_BIN" "$C_RESET"
-    printf '%s服务管理：systemctl {status|restart|stop} xray%s\n\n' "$C_CYAN" "$C_RESET"
+    printf '%s服务管理：systemctl {status|restart|stop} xray@wstls%s\n\n' "$C_CYAN" "$C_RESET"
 }
 
 # ------------------------------ 主流程 ----------------------------------------
@@ -795,6 +834,10 @@ main() {
 
     gen_uuid
     gen_ws_path
+
+    migrate_legacy
+    check_port_conflict
+
     write_config
     write_service
     start_service

@@ -13,9 +13,9 @@ set -euo pipefail
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
-readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
-readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
-readonly SERVICE_FILE="/etc/systemd/system/xray.service"
+readonly CONFIG_FILE="${CONFIG_DIR}/config-tunnel.json"
+readonly INFO_FILE="${CONFIG_DIR}/cgg-tunnel.info"
+readonly SERVICE_FILE="/etc/systemd/system/xray@tunnel.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly CFDD_BIN="/usr/local/bin/cloudflared"
@@ -266,6 +266,45 @@ gen_ws_path() {
     log "WebSocket 路径生成完成：${WS_PATH}"
 }
 
+# ------------------------------ 旧版迁移与端口冲突检测 --------------------------
+# 停止旧版单实例服务（仅处理由本套件写入的 xray.service），并迁移匹配的旧配置
+migrate_legacy() {
+    local old_service="/etc/systemd/system/xray.service"
+    local old_config="${CONFIG_DIR}/config.json"
+    local old_info="${CONFIG_DIR}/cgg-vless.info"
+
+    if [[ -f "$old_service" ]] && grep -q "cgg-vless" "$old_service"; then
+        systemctl stop xray 2>/dev/null || true
+        systemctl disable xray 2>/dev/null || true
+        log "已停止旧版单实例服务 xray"
+    fi
+
+    if [[ -f "$old_config" && ! -f "$CONFIG_FILE" ]]; then
+        local net sec
+        net="$(jq -r '.inbounds[0].network // empty' "$old_config" 2>/dev/null)"
+        sec="$(jq -r '.inbounds[0].security // empty' "$old_config" 2>/dev/null)"
+        if [[ "$net" == "ws" && "$sec" == "none" ]]; then
+            mv "$old_config" "$CONFIG_FILE"
+            [[ -f "$old_info" ]] && mv "$old_info" "$INFO_FILE"
+            log "已迁移旧版 Tunnel 配置到实例化路径"
+        fi
+    fi
+}
+
+# 检查其他已安装实例是否占用同一监听端口
+check_port_conflict() {
+    local f p name
+    for f in "${CONFIG_DIR}"/config-*.json; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f")"
+        [[ "$name" == "config-tunnel.json" ]] && continue
+        p="$(jq -r '.inbounds[0].port // empty' "$f" 2>/dev/null)"
+        if [[ -n "$p" && "$p" == "$LOCAL_PORT" ]]; then
+            die "端口 ${LOCAL_PORT} 已被 ${name} 占用，请更换端口或先卸载对应模式"
+        fi
+    done
+}
+
 # ------------------------------ 配置写入 --------------------------------------
 write_config() {
     install -d -m 755 -o root -g root "$CONFIG_DIR"
@@ -403,13 +442,13 @@ EOF
 start_service() {
     log "启用并启动 Xray 服务..."
     systemctl daemon-reload
-    systemctl enable xray >/dev/null 2>&1 || warn "设置开机自启失败"
-    systemctl restart xray || true
+    systemctl enable xray@tunnel >/dev/null 2>&1 || warn "设置开机自启失败"
+    systemctl restart xray@tunnel || true
     sleep 1
 
-    if ! systemctl is-active --quiet xray; then
+    if ! systemctl is-active --quiet xray@tunnel; then
         err "Xray 启动失败，最近日志如下："
-        journalctl -u xray -n 20 --no-pager >&2 || true
+        journalctl -u xray@tunnel -n 20 --no-pager >&2 || true
         die "请根据日志排查后重试"
     fi
     log "Xray 已启动，并已设置开机自启"
@@ -568,7 +607,7 @@ print_result() {
         warn "未安装 qrencode，跳过二维码输出"
     fi
 
-    printf '%s服务管理：systemctl {status|restart|stop} xray%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s服务管理：systemctl {status|restart|stop} xray@tunnel%s\n' "$C_CYAN" "$C_RESET"
     if [[ "$TUNNEL_TYPE" == "quick" ]]; then
         printf '%s隧道服务：%s（日志：journalctl -u %s -n 50）%s\n\n' "$C_CYAN" "$QUICK_SERVICE" "$QUICK_SERVICE" "$C_RESET"
     else
@@ -593,6 +632,10 @@ main() {
     ensure_xray
     gen_uuid
     gen_ws_path
+
+    migrate_legacy
+    check_port_conflict
+
     write_config
     write_service
     start_service
