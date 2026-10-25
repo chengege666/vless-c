@@ -307,6 +307,12 @@ free_port_80() {
     esac
 }
 
+# 验证 Xray 二进制可执行且能正常运行
+verify_xray_runtime() {
+    [[ -x "$XRAY_BIN" ]] || return 1
+    "$XRAY_BIN" version >/dev/null 2>&1
+}
+
 # ------------------------------ 安装 Xray -------------------------------------
 ensure_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
