@@ -13,9 +13,9 @@ set -euo pipefail
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
-readonly CONFIG_FILE="${CONFIG_DIR}/config-tunnel.json"
-readonly INFO_FILE="${CONFIG_DIR}/cgg-tunnel.info"
-readonly SERVICE_FILE="/etc/systemd/system/xray@tunnel.service"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
+readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly CFDD_BIN="/usr/local/bin/cloudflared"
@@ -205,55 +205,6 @@ ask_local_port() {
 }
 
 # ------------------------------ 安装 Xray -------------------------------------
-verify_xray_runtime() {
-    [[ -x "$XRAY_BIN" ]] || return 1
-    "$XRAY_BIN" version >/dev/null 2>&1
-}
-
-# 直接从 GitHub releases 下载 Xray 二进制（绕过 GitHub API 速率限制 403）
-install_xray_binary() {
-    local arch
-    case "$(uname -m)" in
-        x86_64)  arch="64" ;;
-        aarch64) arch="arm64-v8a" ;;
-        armv7l)  arch="arm32-v7a" ;;
-        *) die "不支持的 CPU 架构：$(uname -m)" ;;
-    esac
-
-    local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip"
-    local tmp
-    tmp="$(mktemp -d)"
-
-    log "下载 Xray release 包：${url}"
-    if ! curl -fL --retry 3 --connect-timeout 15 -o "${tmp}/xray.zip" "$url"; then
-        rm -rf "$tmp"
-        return 1
-    fi
-
-    if ! command -v unzip >/dev/null 2>&1; then
-        log "安装解压工具 unzip"
-        apt-get update -y >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends unzip >/dev/null 2>&1 || true
-        command -v unzip >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
-    fi
-
-    if ! unzip -o "${tmp}/xray.zip" -d "${tmp}/xray" >/dev/null 2>&1; then
-        rm -rf "$tmp"
-        return 1
-    fi
-    [[ -x "${tmp}/xray/xray" ]] || { rm -rf "$tmp"; return 1; }
-
-    install -m 755 "${tmp}/xray/xray" "$XRAY_BIN" || { rm -rf "$tmp"; return 1; }
-
-    # 安装 geoip/geosite 数据（可选，缺失不阻断）
-    install -d -m 755 /usr/local/share/xray
-    [[ -f "${tmp}/xray/geoip.dat" ]] && install -m 644 "${tmp}/xray/geoip.dat" /usr/local/share/xray/ || true
-    [[ -f "${tmp}/xray/geosite.dat" ]] && install -m 644 "${tmp}/xray/geosite.dat" /usr/local/share/xray/ || true
-
-    rm -rf "$tmp"
-    return 0
-}
-
 ensure_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
         log "检测到已安装 Xray：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
@@ -269,19 +220,8 @@ ensure_xray() {
     fi
     bash "$installer" install || rc=$?
     rm -f "$installer"
-
-    if (( rc == 0 )); then
-        [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
-        verify_xray_runtime || die "Xray 安装完成但无法运行，请按上方提示排查"
-        return 0
-    fi
-
-    # 官方安装脚本失败（常见：GitHub API 403 速率限制），回退到直接下载 release 二进制
-    warn "官方安装脚本失败（退出码 ${rc}），尝试直接下载 release 二进制..."
-    install_xray_binary || die "Xray 安装失败（官方脚本与直链下载均失败）"
+    (( rc == 0 )) || die "Xray 安装失败（退出码 ${rc}）"
     [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
-    verify_xray_runtime || die "Xray 安装完成但无法运行，请按上方提示排查"
-    log "Xray 安装完成：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
 }
 
 # ------------------------------ 安装 cloudflared ------------------------------
@@ -324,45 +264,6 @@ gen_ws_path() {
     WS_PATH="/cgg-${rand}"
     [[ ${#WS_PATH} -ge 8 ]] || die "WS 路径生成失败"
     log "WebSocket 路径生成完成：${WS_PATH}"
-}
-
-# ------------------------------ 旧版迁移与端口冲突检测 --------------------------
-# 停止旧版单实例服务（仅处理由本套件写入的 xray.service），并迁移匹配的旧配置
-migrate_legacy() {
-    local old_service="/etc/systemd/system/xray.service"
-    local old_config="${CONFIG_DIR}/config.json"
-    local old_info="${CONFIG_DIR}/cgg-vless.info"
-
-    if [[ -f "$old_service" ]] && grep -q "cgg-vless" "$old_service"; then
-        systemctl stop xray 2>/dev/null || true
-        systemctl disable xray 2>/dev/null || true
-        log "已停止旧版单实例服务 xray"
-    fi
-
-    if [[ -f "$old_config" && ! -f "$CONFIG_FILE" ]]; then
-        local net sec
-        net="$(jq -r '.inbounds[0].network // empty' "$old_config" 2>/dev/null)"
-        sec="$(jq -r '.inbounds[0].security // empty' "$old_config" 2>/dev/null)"
-        if [[ "$net" == "ws" && "$sec" == "none" ]]; then
-            mv "$old_config" "$CONFIG_FILE"
-            [[ -f "$old_info" ]] && mv "$old_info" "$INFO_FILE"
-            log "已迁移旧版 Tunnel 配置到实例化路径"
-        fi
-    fi
-}
-
-# 检查其他已安装实例是否占用同一监听端口
-check_port_conflict() {
-    local f p name
-    for f in "${CONFIG_DIR}"/config-*.json; do
-        [[ -f "$f" ]] || continue
-        name="$(basename "$f")"
-        [[ "$name" == "config-tunnel.json" ]] && continue
-        p="$(jq -r '.inbounds[0].port // empty' "$f" 2>/dev/null)"
-        if [[ -n "$p" && "$p" == "$LOCAL_PORT" ]]; then
-            die "端口 ${LOCAL_PORT} 已被 ${name} 占用，请更换端口或先卸载对应模式"
-        fi
-    done
 }
 
 # ------------------------------ 配置写入 --------------------------------------
@@ -502,13 +403,13 @@ EOF
 start_service() {
     log "启用并启动 Xray 服务..."
     systemctl daemon-reload
-    systemctl enable xray@tunnel >/dev/null 2>&1 || warn "设置开机自启失败"
-    systemctl restart xray@tunnel || true
+    systemctl enable xray >/dev/null 2>&1 || warn "设置开机自启失败"
+    systemctl restart xray || true
     sleep 1
 
-    if ! systemctl is-active --quiet xray@tunnel; then
+    if ! systemctl is-active --quiet xray; then
         err "Xray 启动失败，最近日志如下："
-        journalctl -u xray@tunnel -n 20 --no-pager >&2 || true
+        journalctl -u xray -n 20 --no-pager >&2 || true
         die "请根据日志排查后重试"
     fi
     log "Xray 已启动，并已设置开机自启"
@@ -667,7 +568,7 @@ print_result() {
         warn "未安装 qrencode，跳过二维码输出"
     fi
 
-    printf '%s服务管理：systemctl {status|restart|stop} xray@tunnel%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s服务管理：systemctl {status|restart|stop} xray%s\n' "$C_CYAN" "$C_RESET"
     if [[ "$TUNNEL_TYPE" == "quick" ]]; then
         printf '%s隧道服务：%s（日志：journalctl -u %s -n 50）%s\n\n' "$C_CYAN" "$QUICK_SERVICE" "$QUICK_SERVICE" "$C_RESET"
     else
@@ -692,10 +593,6 @@ main() {
     ensure_xray
     gen_uuid
     gen_ws_path
-
-    migrate_legacy
-    check_port_conflict
-
     write_config
     write_service
     start_service
