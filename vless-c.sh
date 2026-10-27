@@ -788,8 +788,8 @@ service_action() {
 
     sleep 1
 
-    # Cloudflare Tunnel 服务联动（固定：cloudflared；临时：cgg-quick-tunnel）
-    if (( has_xray == 1 )); then
+    # Cloudflare Tunnel 服务仅在存在 Tunnel 节点时联动（固定：cloudflared；临时：cgg-quick-tunnel）
+    if (( has_xray == 1 )) && inbound_exists "$TAG_TUNNEL"; then
         local tsvc
         for tsvc in cloudflared cgg-quick-tunnel; do
             if systemctl cat "$tsvc" >/dev/null 2>&1; then
@@ -893,7 +893,7 @@ change_sni() {
         return 1
     fi
 
-    local input tmp
+    local input tmp cfg_group
     read -r -p "请输入新的伪装域名（当前 ${R_SNI}）：" input
     input="${input//[[:space:]]/}"
     [[ -n "$input" ]] || { warn "输入为空，已取消"; return 1; }
@@ -921,8 +921,16 @@ change_sni() {
         return 1
     fi
 
+    # 保留原配置属组，避免 Xray 以 nobody 运行时无法读取
+    cfg_group="$(stat -c '%G' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$cfg_group" ]] || cfg_group="root"
     cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    mv "$tmp" "$CONFIG_FILE"
+    if ! install -m 640 -o root -g "$cfg_group" "$tmp" "$CONFIG_FILE"; then
+        rm -f "$tmp"
+        err "写入配置失败，已保留原配置"
+        return 1
+    fi
+    rm -f "$tmp"
     chmod 640 "$CONFIG_FILE"
 
     R_SNI="$input"
@@ -937,7 +945,7 @@ reset_uuid() {
         return 1
     fi
 
-    local ans tmp new_uuid
+    local ans tmp new_uuid cfg_group
     read -r -p "确认重置 UUID？旧 UUID 将立即失效 [y/N]：" ans
     case "$ans" in
         [Yy]*) ;;
@@ -966,8 +974,16 @@ reset_uuid() {
         return 1
     fi
 
+    # 保留原配置属组，避免 Xray 以 nobody 运行时无法读取
+    cfg_group="$(stat -c '%G' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$cfg_group" ]] || cfg_group="root"
     cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    mv "$tmp" "$CONFIG_FILE"
+    if ! install -m 640 -o root -g "$cfg_group" "$tmp" "$CONFIG_FILE"; then
+        rm -f "$tmp"
+        err "写入配置失败，已保留原配置"
+        return 1
+    fi
+    rm -f "$tmp"
     chmod 640 "$CONFIG_FILE"
 
     R_UUID="$new_uuid"
@@ -1511,15 +1527,11 @@ uninstall_node_choices() {
     fi
 }
 
-# 删除 CF Tunnel 对应的隧道服务（保留 cloudflared 主程序）
+# 删除 CF Tunnel 相关服务（固定与临时一并清理，保留 cloudflared 主程序）
 remove_tunnel_service() {
-    local ttype="$1" ans svc list=() found=0 removed=0
-
-    if [[ "$ttype" == "quick" ]]; then
-        list=("cgg-quick-tunnel")
-    else
-        list=("cloudflared" "cloudflared-update")
-    fi
+    local ans svc
+    local list=("cloudflared" "cloudflared-update" "cgg-quick-tunnel")
+    local found=0 removed=0
 
     for svc in "${list[@]}"; do
         if systemctl cat "$svc" >/dev/null 2>&1 || [[ -f "/etc/systemd/system/${svc}.service" ]]; then
@@ -1558,7 +1570,7 @@ remove_tunnel_service() {
 
 # 卸载单个 Xray 节点：只删除对应 inbound 与元信息，其他节点保持不变
 remove_xray_node() {
-    local tag="$1" tmp backup tunnel_type ans cfg_group remaining
+    local tag="$1" tmp backup ans cfg_group remaining
 
     command -v jq >/dev/null 2>&1 || { err "缺少 jq，无法修改配置"; return 1; }
     [[ -x "$XRAY_BIN" ]] || { err "未找到 Xray 可执行文件：${XRAY_BIN}"; return 1; }
@@ -1571,12 +1583,6 @@ remove_xray_node() {
     if [[ "$ans" != "yes" ]]; then
         warn "已取消"
         return 1
-    fi
-
-    # 隧道节点需要按安装时记录的类型清理对应服务
-    if [[ "$tag" == "$TAG_TUNNEL" ]]; then
-        tunnel_type="$(read_node_value "$TAG_TUNNEL" TUNNEL_TYPE || true)"
-        [[ -n "$tunnel_type" ]] || tunnel_type="fixed"
     fi
 
     backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
@@ -1617,7 +1623,7 @@ remove_xray_node() {
 
     # CF Tunnel 节点需同时清理隧道服务
     if [[ "$tag" == "$TAG_TUNNEL" ]]; then
-        remove_tunnel_service "$tunnel_type"
+        remove_tunnel_service
     fi
 
     remaining="$(xray_node_tags || true)"

@@ -16,6 +16,8 @@ readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
 readonly NODES_DIR="${CONFIG_DIR}/nodes"
 readonly NODE_TAG="vless-reality"
 readonly NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
+# AnyTLS 使用独立配置，端口冲突检测需要读取
+readonly ANYTLS_CONFIG="/usr/local/etc/sing-box/config.json"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -147,6 +149,32 @@ port_in_use() {
     ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${p}$"
 }
 
+# 检查端口是否已被其他 Xray 节点或 AnyTLS 配置占用（服务停止时 ss 无法发现）
+# 输出冲突来源描述，无冲突时返回 1
+port_config_conflict() {
+    local port="$1" tag="$2" p at
+    command -v jq >/dev/null 2>&1 || return 1
+
+    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] || continue
+            if [[ "$p" == "$port" ]]; then
+                printf '其他 Xray 节点'
+                return 0
+            fi
+        done < <(jq -r --arg tag "$tag" '.inbounds[]? | select(.tag != $tag) | .port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    fi
+
+    if [[ -f "$ANYTLS_CONFIG" ]] && jq empty "$ANYTLS_CONFIG" >/dev/null 2>&1; then
+        at="$(jq -r '.inbounds[]? | select(.type == "anytls") | .listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$at" && "$at" == "$port" ]]; then
+            printf 'AnyTLS 节点'
+            return 0
+        fi
+    fi
+    return 1
+}
+
 random_port() {
     local i p
     for i in $(seq 1 30); do
@@ -163,10 +191,13 @@ random_port() {
 }
 
 ask_port() {
-    local default_port input
+    local default_port input conflict
     default_port="$(random_port)"
 
     if [[ ! -t 0 ]]; then
+        if conflict="$(port_config_conflict "$default_port" "$NODE_TAG")"; then
+            die "随机端口 ${default_port} 已被${conflict}占用，请手动指定端口"
+        fi
         PORT="$default_port"
         log "非交互模式：使用随机端口 ${PORT}"
         return 0
@@ -177,9 +208,12 @@ ask_port() {
 
     if [[ -z "$input" ]]; then
         PORT="$default_port"
-    elif [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 65535 )); then
+    elif [[ "$input" =~ ^[0-9]+$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
         if port_in_use "$input"; then
             die "端口 ${input} 已被占用，请更换"
+        fi
+        if conflict="$(port_config_conflict "$input" "$NODE_TAG")"; then
+            die "端口 ${input} 已被${conflict}占用，请更换"
         fi
         PORT="$input"
     else
@@ -295,7 +329,10 @@ merge_config() {
     # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
     tmp_cfg="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
 
-    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            die "现有配置不是合法 JSON：${CONFIG_FILE}（同目录 .bak 为备份），请修复后重试"
+        fi
         if ! jq --slurpfile new "$new_cfg" --arg tag "$NODE_TAG" '
             .inbounds = (((.inbounds // []) | map(select(.tag != $tag))) + [$new[0].inbounds[0]])
             | .outbounds = (.outbounds // $new[0].outbounds)
@@ -531,7 +568,17 @@ maybe_enable_bbr() {
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-            sysctl --system >/dev/null 2>&1 || true
+            # 逐条应用并回读，避免 sysctl --system 吞掉错误导致误判成功
+            local line key val
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                key="${line%%=*}"
+                val="${line#*=}"
+                key="${key//[[:space:]]/}"
+                val="${val//[[:space:]]/}"
+                sysctl -w "${key}=${val}" >/dev/null 2>&1 \
+                    || warn "应用失败：${key}（当前内核或容器可能不支持）"
+            done < /etc/sysctl.d/99-cgg-bbr.conf
             cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
             if [[ "$cc" == "bbr" ]]; then
                 log "BBR 已开启"
@@ -581,7 +628,6 @@ print_result() {
     printf '  UUID        : %s\n' "$UUID"
     printf '  流控 flow   : xtls-rprx-vision\n'
     printf '  公钥 pbk    : %s\n' "$PUBLIC_KEY"
-    printf '  私钥 pvk    : %s\n' "$PRIVATE_KEY"
     printf '  ShortID     : %s\n' "$SHORT_ID"
     printf '  伪装域名SNI : %s\n' "$SNI"
     printf '  传输协议    : tcp\n'

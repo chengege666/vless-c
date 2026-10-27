@@ -165,7 +165,7 @@ ask_port() {
     input="${input//[[:space:]]/}"
     if [[ -z "$input" ]]; then
         PORT="$default_port"
-    elif [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 65535 )); then
+    elif [[ "$input" =~ ^[0-9]+$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
         if port_in_use "$input"; then
             die "端口 ${input} 已被占用，请更换"
         fi
@@ -446,7 +446,17 @@ maybe_enable_bbr() {
             modprobe tcp_bbr >/dev/null 2>&1 || warn "无法加载 tcp_bbr 模块，可能内核不支持"
             printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' \
                 > /etc/sysctl.d/99-cgg-bbr.conf
-            sysctl --system >/dev/null 2>&1 || true
+            # 逐条应用并回读，避免 sysctl --system 吞掉错误导致误判成功
+            local line key val
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                key="${line%%=*}"
+                val="${line#*=}"
+                key="${key//[[:space:]]/}"
+                val="${val//[[:space:]]/}"
+                sysctl -w "${key}=${val}" >/dev/null 2>&1 \
+                    || warn "应用失败：${key}（当前内核或容器可能不支持）"
+            done < /etc/sysctl.d/99-cgg-bbr.conf
             log "BBR 配置已写入"
             ;;
         *)

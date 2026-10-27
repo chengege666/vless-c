@@ -19,6 +19,8 @@ readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
 readonly NODES_DIR="${CONFIG_DIR}/nodes"
 readonly NODE_TAG="vless-ws-tunnel"
 readonly NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
+# AnyTLS 使用独立配置，端口冲突检测需要读取
+readonly ANYTLS_CONFIG="/usr/local/etc/sing-box/config.json"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -188,13 +190,49 @@ ask_node_name() {
     log "节点名称：${NODE_NAME}"
 }
 
-ask_local_port() {
-    [[ -t 0 ]] || { log "非交互模式：使用默认本地端口 ${LOCAL_PORT}"; return 0; }
+# 检查端口是否已被其他 Xray 节点或 AnyTLS 配置占用（服务停止时 ss 无法发现）
+# 输出冲突来源描述，无冲突时返回 1
+port_config_conflict() {
+    local port="$1" tag="$2" p at
+    command -v jq >/dev/null 2>&1 || return 1
 
-    local input
+    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] || continue
+            if [[ "$p" == "$port" ]]; then
+                printf '其他 Xray 节点'
+                return 0
+            fi
+        done < <(jq -r --arg tag "$tag" '.inbounds[]? | select(.tag != $tag) | .port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    fi
+
+    if [[ -f "$ANYTLS_CONFIG" ]] && jq empty "$ANYTLS_CONFIG" >/dev/null 2>&1; then
+        at="$(jq -r '.inbounds[]? | select(.type == "anytls") | .listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$at" && "$at" == "$port" ]]; then
+            printf 'AnyTLS 节点'
+            return 0
+        fi
+    fi
+    return 1
+}
+
+ask_local_port() {
+    local input conflict
+
+    if [[ ! -t 0 ]]; then
+        if conflict="$(port_config_conflict "$LOCAL_PORT" "$NODE_TAG")"; then
+            die "本地端口 ${LOCAL_PORT} 已被${conflict}占用，请手动指定其他端口"
+        fi
+        log "非交互模式：使用默认本地端口 ${LOCAL_PORT}"
+        return 0
+    fi
+
     read -r -p "Xray 本地监听端口（仅 127.0.0.1 回源用，回车默认 ${DEFAULT_LOCAL_PORT}）：" input || return 0
     input="${input//[[:space:]]/}"
     if [[ -z "$input" ]]; then
+        if conflict="$(port_config_conflict "$LOCAL_PORT" "$NODE_TAG")"; then
+            die "本地端口 ${LOCAL_PORT} 已被${conflict}占用，请手动指定其他端口"
+        fi
         log "本地端口：${LOCAL_PORT}"
         return 0
     fi
@@ -203,6 +241,9 @@ ask_local_port() {
     fi
     if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${input}" 2>/dev/null | grep -q .; then
         die "端口 ${input} 已被占用，请更换"
+    fi
+    if conflict="$(port_config_conflict "$input" "$NODE_TAG")"; then
+        die "端口 ${input} 已被${conflict}占用，请更换"
     fi
     LOCAL_PORT="$input"
     log "本地端口：${LOCAL_PORT}"
@@ -279,7 +320,10 @@ merge_config() {
     # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
     tmp_cfg="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
 
-    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            die "现有配置不是合法 JSON：${CONFIG_FILE}（同目录 .bak 为备份），请修复后重试"
+        fi
         if ! jq --slurpfile new "$new_cfg" --arg tag "$NODE_TAG" '
             .inbounds = (((.inbounds // []) | map(select(.tag != $tag))) + [$new[0].inbounds[0]])
             | .outbounds = (.outbounds // $new[0].outbounds)
@@ -461,6 +505,32 @@ start_service() {
     log "Xray 已启动，并已设置开机自启"
 }
 
+# 清理固定隧道与临时隧道的残留服务，避免切换类型后旧隧道继续运行
+cleanup_tunnel_services() {
+    local svc found=0
+
+    for svc in cloudflared cloudflared-update cgg-quick-tunnel; do
+        if systemctl cat "$svc" >/dev/null 2>&1 || [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+            found=1
+        fi
+    done
+    if (( found == 0 )); then
+        return 0
+    fi
+
+    warn "检测到旧隧道服务残留，将先停止并清理（若本机还有其他项目在用 cloudflared 隧道，请先确认）"
+    if [[ -x "$CFDD_BIN" ]]; then
+        "$CFDD_BIN" service uninstall >/dev/null 2>&1 || true
+    fi
+    for svc in cloudflared cloudflared-update cgg-quick-tunnel; do
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${svc}.service"
+    done
+    systemctl daemon-reload
+    log "旧隧道服务清理完成"
+}
+
 # ------------------------------ 固定隧道 --------------------------------------
 setup_fixed_tunnel() {
     printf '\n%s-------- 固定隧道配置提示 --------%s\n' "$C_CYAN" "$C_RESET"
@@ -476,19 +546,8 @@ setup_fixed_tunnel() {
     fi
     [[ -n "$CF_TOKEN" ]] || die "Token 不能为空"
 
-    # 重装场景：先清理旧服务与残留文件（含 cloudflared-update.service）再注册，
-    # 否则 service install 会报 "already installed" 而失败
-    if systemctl cat cloudflared >/dev/null 2>&1 || [[ -f /etc/systemd/system/cloudflared-update.service ]]; then
-        warn "检测到旧 cloudflared 服务残留，将先停止并清理（若本机还有其他项目在用 cloudflared 隧道，请先确认）"
-        if [[ -x "$CFDD_BIN" ]]; then
-            "$CFDD_BIN" service uninstall >/dev/null 2>&1 || true
-        fi
-        systemctl stop cloudflared cloudflared-update >/dev/null 2>&1 || true
-        systemctl disable cloudflared cloudflared-update >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/cloudflared.service /etc/systemd/system/cloudflared-update.service
-        systemctl daemon-reload
-        log "旧服务清理完成"
-    fi
+    # 重装或从临时隧道切换时先清理旧服务，否则 service install 会报 "already installed"
+    cleanup_tunnel_services
 
     log "注册 cloudflared 服务..."
     if ! "$CFDD_BIN" service install "$CF_TOKEN"; then
@@ -530,6 +589,10 @@ quick_tunnel_url() {
 
 setup_quick_tunnel() {
     local unit_file="/etc/systemd/system/${QUICK_SERVICE}.service"
+
+    # 重装或从固定隧道切换时先清理旧服务，避免旧隧道继续运行
+    cleanup_tunnel_services
+
     log "写入临时隧道服务：${unit_file}"
 
     cat > "$unit_file" <<EOF

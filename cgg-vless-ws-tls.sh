@@ -17,6 +17,8 @@ readonly NODES_DIR="${CONFIG_DIR}/nodes"
 readonly NODE_TAG="vless-ws-tls"
 readonly NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
+# AnyTLS 使用独立配置，端口冲突检测需要读取
+readonly ANYTLS_CONFIG="/usr/local/etc/sing-box/config.json"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly ACME_HOME="/root/.acme.sh"
@@ -224,24 +226,56 @@ ask_cert_source() {
     log "证书来源：${CERT_SOURCE}"
 }
 
+# 检查端口是否已被其他 Xray 节点或 AnyTLS 配置占用（服务停止时 ss 无法发现）
+# 输出冲突来源描述，无冲突时返回 1
+port_config_conflict() {
+    local port="$1" tag="$2" p at
+    command -v jq >/dev/null 2>&1 || return 1
+
+    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        while IFS= read -r p; do
+            [[ -n "$p" ]] || continue
+            if [[ "$p" == "$port" ]]; then
+                printf '其他 Xray 节点'
+                return 0
+            fi
+        done < <(jq -r --arg tag "$tag" '.inbounds[]? | select(.tag != $tag) | .port // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    fi
+
+    if [[ -f "$ANYTLS_CONFIG" ]] && jq empty "$ANYTLS_CONFIG" >/dev/null 2>&1; then
+        at="$(jq -r '.inbounds[]? | select(.type == "anytls") | .listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$at" && "$at" == "$port" ]]; then
+            printf 'AnyTLS 节点'
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # ------------------------------ 监听端口 --------------------------------------
 # 默认 443；NAT VPS 可选择服务商分配端口范围内的自定义端口
 ask_listen_port() {
     [[ -t 0 ]] || { log "非交互模式：使用默认监听端口 ${LISTEN_PORT}"; return 0; }
 
-    local choice input
+    local choice input conflict
     printf '\n选择监听端口模式：\n'
     printf '  1) 默认 443（普通 VPS 推荐）\n'
     printf '  2) 自定义端口（NAT VPS 受限端口范围）\n'
     read -r -p "请选择 [1-2]（回车默认 1）：" choice || return 0
     case "${choice:-1}" in
         1)
+            if conflict="$(port_config_conflict "$LISTEN_PORT" "$NODE_TAG")"; then
+                die "端口 ${LISTEN_PORT} 已被${conflict}占用，请改用自定义端口"
+            fi
             log "监听端口：${LISTEN_PORT}"
             ;;
         2)
             read -r -p "请输入监听端口（1-65535）：" input || return 0
             input="${input//[[:space:]]/}"
             if [[ -z "$input" ]]; then
+                if conflict="$(port_config_conflict "$LISTEN_PORT" "$NODE_TAG")"; then
+                    die "端口 ${LISTEN_PORT} 已被${conflict}占用，请改用自定义端口"
+                fi
                 warn "输入为空，使用默认端口 443"
                 return 0
             fi
@@ -250,6 +284,9 @@ ask_listen_port() {
             fi
             if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${input}" 2>/dev/null | grep -q .; then
                 die "端口 ${input} 已被占用，请更换"
+            fi
+            if conflict="$(port_config_conflict "$input" "$NODE_TAG")"; then
+                die "端口 ${input} 已被${conflict}占用，请更换"
             fi
             LISTEN_PORT="$input"
             log "监听端口：${LISTEN_PORT}"
@@ -527,7 +564,10 @@ merge_config() {
     # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
     tmp_cfg="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
 
-    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            die "现有配置不是合法 JSON：${CONFIG_FILE}（同目录 .bak 为备份），请修复后重试"
+        fi
         if ! jq --slurpfile new "$new_cfg" --arg tag "$NODE_TAG" '
             .inbounds = (((.inbounds // []) | map(select(.tag != $tag))) + [$new[0].inbounds[0]])
             | .outbounds = (.outbounds // $new[0].outbounds)
