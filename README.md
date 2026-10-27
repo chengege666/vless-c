@@ -1,8 +1,8 @@
 # cgg-vless
 
-一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
+一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** / **Hysteria 2** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
 
-VLESS 系列统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议；AnyTLS 因 Xray-core 不支持，使用独立 sing-box 后端。
+VLESS 系列统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议；AnyTLS 与 Hysteria 2 因 Xray-core 不支持，使用独立 sing-box 后端。
 
 ```
   ██████╗ ██████╗  ██████╗     ██╗   ██╗██╗     ███████╗███████╗███████╗
@@ -76,6 +76,22 @@ Xray-core 不支持 AnyTLS，该模式由脚本安装 **独立 sing-box 后端**
 安装时会自动生成 32 位十六进制密码，完成后输出 `anytls://` 链接与二维码；NAT 机需在服务商面板把外部端口映射到相同内部端口。
 
 
+## Hysteria 2 模式（总菜单第 14 项）
+
+Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安装 **sing-box 后端**；配置 `hysteria2.json`、服务 `cgg-hysteria2`、元信息均与 Xray / AnyTLS 分离，可与现有节点并存。
+
+| 项目 | 说明 |
+|---|---|
+| 是否需要域名 | 需要，用于证书与 SNI（客户端会校验证书） |
+| 证书 | 复用 `/usr/local/etc/xray/cert`，或手动填 `.cer` / `.key` 路径 |
+| 默认端口 | 443（**UDP**，可自定义；与 Xray 的 TCP 443 可共存） |
+| 传输 | QUIC / UDP，ALPN 固定 `h3`，TCP 与 UDP 流量均由 sing-box 原生转发 |
+| 客户端 | sing-box、mihomo(Clash.Meta)、官方 Hysteria 2 客户端 |
+| CDN | **不支持**套 Cloudflare CDN（QUIC 无法回源） |
+
+安装前会检测 UDP 端口占用，安装后自动放行 UDP 端口并校验监听状态；进程异常退出由 systemd `Restart=on-failure` 自动重连。完成后输出 `hysteria2://` 链接与二维码；NAT 机需在服务商面板把 **UDP** 外部端口映射到相同内部端口。
+
+
 ## 输出文件与路径
 
 | 路径 | 内容 |
@@ -88,11 +104,15 @@ Xray-core 不支持 AnyTLS，该模式由脚本安装 **独立 sing-box 后端**
 | `/etc/systemd/system/xray.service` | systemd 服务 |
 | `/usr/local/bin/cloudflared` | Cloudflare Tunnel 客户端（隧道模式） |
 | `/etc/systemd/system/cgg-quick-tunnel.service` | 临时隧道服务（隧道模式） |
-| `/usr/local/bin/sing-box` | sing-box 核心（AnyTLS 模式） |
+| `/usr/local/bin/sing-box` | sing-box 核心（AnyTLS / Hysteria 2 共用） |
 | `/usr/local/etc/sing-box/config.json` | AnyTLS 节点配置（AnyTLS 模式） |
 | `/usr/local/etc/sing-box/cgg-anytls.info` | AnyTLS 元信息（含密码，权限 600） |
 | `/usr/local/etc/sing-box/cert/` | AnyTLS 手动证书副本（AnyTLS 模式） |
 | `/etc/systemd/system/cgg-anytls.service` | AnyTLS 服务（AnyTLS 模式） |
+| `/usr/local/etc/sing-box/hysteria2.json` | Hysteria 2 节点配置（Hysteria 2 模式） |
+| `/usr/local/etc/sing-box/cgg-hysteria2.info` | Hysteria 2 元信息（含密码，权限 600） |
+| `/usr/local/etc/sing-box/cert-hysteria2/` | Hysteria 2 手动证书副本（Hysteria 2 模式） |
+| `/etc/systemd/system/cgg-hysteria2.service` | Hysteria 2 服务（Hysteria 2 模式） |
 | `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 13 项） |
 | `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 13 项） |
 | `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 12 项） |
@@ -131,20 +151,22 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 修改配置：
 
-- 所有模式均可在总菜单第 `9` 项修改节点名称（仅影响分享链接备注）；AnyTLS 已安装时该菜单额外提供「修改 AnyTLS 节点名称」
+- 所有模式均可在总菜单第 `9` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 已安装时该菜单额外提供对应的节点名称修改项
 - Reality：同一菜单可更换 SNI 或重置 UUID
 - WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
 彻底卸载：
 
 - 总菜单第 `11` 项，输入 `yes` 确认
-- 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
+- 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS / Hysteria 2（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
 - **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 10 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
 ```bash
 ufw delete allow <端口>/tcp
+ufw delete allow <端口>/udp
 iptables -D INPUT -p tcp --dport <端口> -j ACCEPT
+iptables -D INPUT -p udp --dport <端口> -j ACCEPT
 ```
 
 

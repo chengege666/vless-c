@@ -28,11 +28,17 @@ readonly ANYTLS_CONFIG="${SINGBOX_DIR}/config.json"
 readonly ANYTLS_INFO="${SINGBOX_DIR}/cgg-anytls.info"
 readonly ANYTLS_SERVICE_FILE="/etc/systemd/system/cgg-anytls.service"
 
+# Hysteria 2 复用 sing-box 二进制，配置与服务独立存放
+readonly HS2_CONFIG="${SINGBOX_DIR}/hysteria2.json"
+readonly HS2_INFO="${SINGBOX_DIR}/cgg-hysteria2.info"
+readonly HS2_SERVICE_FILE="/etc/systemd/system/cgg-hysteria2.service"
+
 # 子脚本文件名
 readonly SCRIPT_REALITY="cgg-vless-reality.sh"
 readonly SCRIPT_WS="cgg-vless-ws-tls.sh"
 readonly SCRIPT_TUNNEL="cgg-vless-tunnel.sh"
 readonly SCRIPT_ANYTLS="cgg-vless-anytls.sh"
+readonly SCRIPT_HS2="cgg-vless-hysteria2.sh"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -265,6 +271,11 @@ install_anytls() {
     run_child "$SCRIPT_ANYTLS"
 }
 
+# Hysteria 2 同样使用独立 sing-box 后端，仅在 UDP 端口冲突时由子脚本拦截
+install_hysteria2() {
+    run_child "$SCRIPT_HS2"
+}
+
 # ------------------------------ 元信息文件读写 --------------------------------
 # 读取 INFO_FILE 中指定键的值（键不存在时输出为空）
 read_info_value() {
@@ -308,6 +319,25 @@ update_anytls_info() {
         sed -i "s|^${key}=.*|${key}=${value}|" "$ANYTLS_INFO"
     else
         printf '%s=%s\n' "$key" "$value" >> "$ANYTLS_INFO"
+    fi
+}
+
+# Hysteria 2 元信息同样独立存放
+read_hysteria2_info() {
+    local key="$1"
+    [[ -f "$HS2_INFO" ]] || return 1
+    sed -n "s/^${key}=//p" "$HS2_INFO" | head -n 1
+}
+
+update_hysteria2_info() {
+    local key="$1" value="$2"
+    [[ -f "$HS2_INFO" ]] || return 1
+    if grep -q "^${key}=" "$HS2_INFO"; then
+        value="${value//|/\\|}"
+        value="${value//&/\\&}"
+        sed -i "s|^${key}=.*|${key}=${value}|" "$HS2_INFO"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$HS2_INFO"
     fi
 }
 
@@ -519,6 +549,48 @@ show_info_anytls() {
     printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$ANYTLS_CONFIG" "$C_RESET"
 }
 
+show_info_hysteria2() {
+    local port domain password node_name link ip
+    if [[ ! -f "$HS2_CONFIG" ]]; then
+        err "未找到 Hysteria 2 配置"
+        return 1
+    fi
+
+    port="$(jq -r '.inbounds[0].listen_port // empty' "$HS2_CONFIG" 2>/dev/null || true)"
+    password="$(jq -r '.inbounds[0].users[0].password // empty' "$HS2_CONFIG" 2>/dev/null || true)"
+    domain="$(read_hysteria2_info DOMAIN || true)"
+    [[ -n "$domain" ]] || domain="$(jq -r '.inbounds[0].tls.server_name // empty' "$HS2_CONFIG" 2>/dev/null || true)"
+    node_name="$(read_hysteria2_info NODE_NAME || true)"
+    [[ -n "$node_name" ]] || node_name="cgg-hysteria2"
+
+    if [[ -z "$port" || -z "$password" || -z "$domain" ]]; then
+        err "Hysteria 2 配置读取不完整，无法生成链接"
+        return 1
+    fi
+
+    ip="${SERVER_IP:-YOUR_SERVER_IP}"
+    link="hysteria2://${password}@${ip}:${port}/?sni=${domain}&alpn=h3#${node_name}"
+
+    printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
+    printf '  模式        : Hysteria 2（sing-box，QUIC/UDP）\n'
+    printf '  节点名称    : %s\n' "$node_name"
+    printf '  地址 (IP)   : %s\n' "$ip"
+    printf '  UDP 端口    : %s\n' "$port"
+    printf '  域名 / SNI  : %s\n' "$domain"
+    printf '  密码        : %s\n' "$password"
+    printf '  ALPN        : h3\n'
+    printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
+    printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
+    print_qr "$link"
+
+    if systemctl is-active --quiet cgg-hysteria2 2>/dev/null; then
+        log "Hysteria 2 服务状态：运行中"
+    else
+        warn "Hysteria 2 服务状态：未运行"
+    fi
+    printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$HS2_CONFIG" "$C_RESET"
+}
+
 show_info() {
     if command -v jq >/dev/null 2>&1; then
         :
@@ -571,6 +643,12 @@ show_info() {
         shown=1
     fi
 
+    # Hysteria 2 与 Xray / AnyTLS 并存时一并显示
+    if [[ -f "$HS2_CONFIG" ]]; then
+        show_info_hysteria2
+        shown=1
+    fi
+
     if (( shown == 0 )); then
         err "未找到配置，请先执行安装"
         return 1
@@ -580,11 +658,12 @@ show_info() {
 # ------------------------------ 服务控制 --------------------------------------
 service_action() {
     local action="$1"
-    local has_xray=0 has_anytls=0 failed=0
+    local has_xray=0 has_anytls=0 has_hs2=0 failed=0
     [[ -f "$SERVICE_FILE" ]] && has_xray=1
     [[ -f "$ANYTLS_SERVICE_FILE" ]] && has_anytls=1
+    [[ -f "$HS2_SERVICE_FILE" ]] && has_hs2=1
 
-    if (( has_xray == 0 && has_anytls == 0 )); then
+    if (( has_xray == 0 && has_anytls == 0 && has_hs2 == 0 )); then
         err "未找到 systemd 服务，请先执行安装"
         return 1
     fi
@@ -596,6 +675,11 @@ service_action() {
     # AnyTLS 使用独立 sing-box 服务，与 Xray 分别控制
     if (( has_anytls == 1 )); then
         systemctl "$action" cgg-anytls || { err "systemctl ${action} cgg-anytls 失败"; failed=1; }
+    fi
+
+    # Hysteria 2 使用独立 sing-box 服务，与 Xray / AnyTLS 分别控制
+    if (( has_hs2 == 1 )); then
+        systemctl "$action" cgg-hysteria2 || { err "systemctl ${action} cgg-hysteria2 失败"; failed=1; }
     fi
 
     sleep 1
@@ -615,8 +699,12 @@ service_action() {
     fi
 
     if [[ "$action" == "stop" ]]; then
-        if (( has_anytls == 1 )); then
+        if (( has_anytls == 1 && has_hs2 == 1 )); then
+            log "Xray / AnyTLS / Hysteria 2 已停止"
+        elif (( has_anytls == 1 )); then
             log "Xray / AnyTLS 已停止"
+        elif (( has_hs2 == 1 )); then
+            log "Xray / Hysteria 2 已停止"
         else
             log "Xray 已停止"
         fi
@@ -637,6 +725,14 @@ service_action() {
             parts="${parts:+${parts}，}AnyTLS 运行中"
         else
             err "AnyTLS ${action} 后未处于运行状态，请查看日志"
+            failed=1
+        fi
+    fi
+    if (( has_hs2 == 1 )); then
+        if systemctl is-active --quiet cgg-hysteria2; then
+            parts="${parts:+${parts}，}Hysteria 2 运行中"
+        else
+            err "Hysteria 2 ${action} 后未处于运行状态，请查看日志"
             failed=1
         fi
     fi
@@ -830,17 +926,39 @@ change_anytls_node_name() {
     show_info_anytls
 }
 
+# 修改 Hysteria 2 节点名称（仅影响分享链接备注，无需重启）
+change_hysteria2_node_name() {
+    local current input
+    current="$(read_hysteria2_info NODE_NAME || true)"
+    [[ -n "$current" ]] || current="cgg-hysteria2"
+
+    read -r -p "请输入新的 Hysteria 2 节点名称（当前 ${current}，回车取消）：" input
+    input="${input//[#?&%/]/}"
+    input="${input// /_}"
+    [[ -n "$input" ]] || { warn "输入为空，已取消"; return 1; }
+
+    if ! update_hysteria2_info NODE_NAME "$input"; then
+        err "Hysteria 2 元信息文件不存在：${HS2_INFO}"
+        return 1
+    fi
+    log "Hysteria 2 节点名称已更新为：${input}"
+
+    SERVER_IP="$(get_public_ip)"
+    show_info_hysteria2
+}
+
 modify_menu() {
     local mode choice
     mode="$(detect_mode)"
 
-    local has_xray=0 has_anytls=0
+    local has_xray=0 has_anytls=0 has_hs2=0
     if [[ "$mode" == "reality" || "$mode" == "ws" || "$mode" == "tunnel" ]]; then
         has_xray=1
     fi
     [[ -f "$ANYTLS_CONFIG" ]] && has_anytls=1
+    [[ -f "$HS2_CONFIG" ]] && has_hs2=1
 
-    if (( has_xray == 0 && has_anytls == 0 )); then
+    if (( has_xray == 0 && has_anytls == 0 && has_hs2 == 0 )); then
         err "未找到有效配置，请先执行安装"
         return 1
     fi
@@ -854,6 +972,13 @@ modify_menu() {
                 title="anytls"
             fi
         fi
+        if (( has_hs2 == 1 )); then
+            if (( has_xray == 1 || has_anytls == 1 )); then
+                title="${title} + hysteria2"
+            else
+                title="hysteria2"
+            fi
+        fi
         printf '\n%s-------- 修改配置（当前模式：%s）--------%s\n' "$C_CYAN" "$title" "$C_RESET"
         if (( has_xray == 1 )); then
             printf '  1) 修改节点名称\n'
@@ -864,6 +989,9 @@ modify_menu() {
         fi
         if (( has_anytls == 1 )); then
             printf '  4) 修改 AnyTLS 节点名称\n'
+        fi
+        if (( has_hs2 == 1 )); then
+            printf '  5) 修改 Hysteria 2 节点名称\n'
         fi
         printf '  0) 返回主菜单\n'
         if ! read -r -p "请选择：" choice; then
@@ -897,6 +1025,13 @@ modify_menu() {
             4)
                 if (( has_anytls == 1 )); then
                     change_anytls_node_name || true
+                else
+                    warn "无效选项：${choice}"
+                fi
+                ;;
+            5)
+                if (( has_hs2 == 1 )); then
+                    change_hysteria2_node_name || true
                 else
                     warn "无效选项：${choice}"
                 fi
@@ -1208,7 +1343,7 @@ cert_menu() {
 # ------------------------------ 彻底卸载 --------------------------------------
 uninstall_all() {
     local ans
-    warn "即将删除：Xray 核心、配置文件、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS 服务"
+    warn "即将删除：Xray 核心、配置文件、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS 服务、Hysteria 2 服务"
     read -r -p "确认彻底卸载？该操作不可恢复 [yes/N]：" ans
     if [[ "$ans" != "yes" ]]; then
         warn "已取消"
@@ -1252,6 +1387,15 @@ uninstall_all() {
         rm -f "$ANYTLS_SERVICE_FILE"
         systemctl daemon-reload
         log "已删除 AnyTLS 服务"
+    fi
+
+    # 清理 Hysteria 2（sing-box 后端）
+    if [[ -f "$HS2_SERVICE_FILE" ]] || systemctl cat cgg-hysteria2 >/dev/null 2>&1; then
+        systemctl stop cgg-hysteria2 >/dev/null 2>&1 || true
+        systemctl disable cgg-hysteria2 >/dev/null 2>&1 || true
+        rm -f "$HS2_SERVICE_FILE"
+        systemctl daemon-reload
+        log "已删除 Hysteria 2 服务"
     fi
     if [[ -d "$SINGBOX_DIR" ]]; then
         rm -rf "$SINGBOX_DIR"
@@ -1421,6 +1565,10 @@ show_menu() {
     if [[ -f "$ANYTLS_CONFIG" ]]; then
         mode_desc="${mode_desc}${C_CYAN} + AnyTLS${C_RESET}"
     fi
+    # Hysteria 2 同样使用独立 sing-box 后端
+    if [[ -f "$HS2_CONFIG" ]]; then
+        mode_desc="${mode_desc}${C_CYAN} + Hysteria2${C_RESET}"
+    fi
 
     printf '%s==================== cgg-vless 总菜单 ====================%s\n' "$C_MAGENTA" "$C_RESET"
     printf '  当前模式：%b\n' "$mode_desc"
@@ -1437,6 +1585,7 @@ show_menu() {
     printf '  11) 一键彻底卸载\n'
     printf '  12) TCP 窗口调优（无需内核支持）\n'
     printf '  13) 开启 BBR 加速（需内核支持）\n'
+    printf '  14) 安装 Hysteria 2 节点（sing-box 后端）\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -1450,7 +1599,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-13]：" choice; then
+        if ! read -r -p "请选择 [0-14]：" choice; then
             printf '\n'
             return 0
         fi
@@ -1468,6 +1617,7 @@ main_menu() {
             11) uninstall_all || true ;;
             12) enable_tcp_tune || true ;;
             13) enable_bbr || true ;;
+            14) install_hysteria2 || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
