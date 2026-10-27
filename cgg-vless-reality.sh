@@ -22,7 +22,7 @@ readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly DEFAULT_SNI="itunes.apple.com"
-readonly DEFAULT_NODE_NAME="cgg-vless"
+readonly DEFAULT_NODE_NAME="VLESS-Reality"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then

@@ -445,7 +445,7 @@ load_reality() {
     # 优先读取安装时保存的公钥与节点名称
     R_PUBLIC_KEY="$(read_node_value "$TAG_REALITY" PUBLIC_KEY || true)"
     R_NODE_NAME="$(read_node_value "$TAG_REALITY" NODE_NAME || true)"
-    [[ -n "$R_NODE_NAME" ]] || R_NODE_NAME="cgg-vless"
+    [[ -n "$R_NODE_NAME" ]] || R_NODE_NAME="VLESS-Reality"
 
     # 元信息缺失时由私钥反推公钥
     if [[ -z "$R_PUBLIC_KEY" ]]; then
@@ -461,7 +461,7 @@ load_reality() {
 show_info_reality() {
     local link ip node_name
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    node_name="${R_NODE_NAME:-cgg-vless}"
+    node_name="${R_NODE_NAME:-VLESS-Reality}"
     link="vless://${R_UUID}@${ip}:${R_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${R_SNI}&fp=chrome&pbk=${R_PUBLIC_KEY}&sid=${R_SHORT_ID}&type=tcp&headerType=none#${node_name}"
 
     printf '\n%s=============== cgg-vless Reality 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
@@ -860,7 +860,7 @@ save_reality_info() {
         printf 'SNI=%s\n' "$R_SNI"
         printf 'PUBLIC_KEY=%s\n' "$R_PUBLIC_KEY"
         printf 'SHORT_ID=%s\n' "$R_SHORT_ID"
-        printf 'NODE_NAME=%s\n' "${R_NODE_NAME:-cgg-vless}"
+        printf 'NODE_NAME=%s\n' "${R_NODE_NAME:-VLESS-Reality}"
     } > "$nf"
     chmod 600 "$nf"
 
