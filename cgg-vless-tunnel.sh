@@ -15,6 +15,10 @@ readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
+# 每个节点独立保存元信息，支持多个协议节点并存
+readonly NODES_DIR="${CONFIG_DIR}/nodes"
+readonly NODE_TAG="vless-ws-tunnel"
+readonly NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -266,6 +270,48 @@ gen_ws_path() {
     log "WebSocket 路径生成完成：${WS_PATH}"
 }
 
+# ------------------------------ 配置合并 --------------------------------------
+# 把本模式生成的完整配置合并进现有 config.json：
+# 同 tag 的 inbound 替换，其他 inbound 原样保留，避免覆盖已安装的其他节点
+merge_config() {
+    local new_cfg="$1"
+    local tmp_cfg test_log
+    tmp_cfg="$(mktemp)"
+
+    if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        if ! jq --slurpfile new "$new_cfg" --arg tag "$NODE_TAG" '
+            .inbounds = (((.inbounds // []) | map(select(.tag != $tag))) + [$new[0].inbounds[0]])
+            | .outbounds = (.outbounds // $new[0].outbounds)
+            | .log = (.log // $new[0].log)
+        ' "$CONFIG_FILE" > "$tmp_cfg"; then
+            rm -f "$tmp_cfg"
+            die "合并 Xray 配置失败：${CONFIG_FILE}"
+        fi
+    else
+        if ! cp -a "$new_cfg" "$tmp_cfg"; then
+            rm -f "$tmp_cfg"
+            die "生成 Xray 配置失败：${CONFIG_FILE}"
+        fi
+    fi
+
+    test_log="$(mktemp)"
+    if ! "$XRAY_BIN" run -test -config "$tmp_cfg" >"$test_log" 2>&1; then
+        err "配置校验输出："
+        cat "$test_log" >&2 || true
+        rm -f "$test_log" "$tmp_cfg"
+        die "Xray 配置校验失败，未启动服务"
+    fi
+    rm -f "$test_log"
+
+    if ! install -m 640 "$tmp_cfg" "$CONFIG_FILE"; then
+        rm -f "$tmp_cfg"
+        die "写入配置失败：${CONFIG_FILE}"
+    fi
+    rm -f "$tmp_cfg"
+    chown root:"$RUN_GROUP" "$CONFIG_FILE" 2>/dev/null || true
+    chmod 640 "$CONFIG_FILE"
+}
+
 # ------------------------------ 配置写入 --------------------------------------
 write_config() {
     install -d -m 755 -o root -g root "$CONFIG_DIR"
@@ -283,7 +329,11 @@ write_config() {
         log "旧配置已备份：${backup}"
     fi
 
-    cat > "$CONFIG_FILE" <<EOF
+    # 先写入临时文件，再由 merge_config 合并进 config.json，保留其他节点
+    local new_cfg
+    new_cfg="$(mktemp)"
+
+    cat > "$new_cfg" <<EOF
 {
   "log": {
     "loglevel": "warning",
@@ -335,24 +385,15 @@ write_config() {
 }
 EOF
 
-    chown root:"$RUN_GROUP" "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE"
-
-    local test_log
-    test_log="$(mktemp)"
-    if ! "$XRAY_BIN" run -test -config "$CONFIG_FILE" >"$test_log" 2>&1; then
-        err "配置校验输出："
-        cat "$test_log" >&2 || true
-        rm -f "$test_log"
-        die "Xray 配置校验失败，未启动服务"
-    fi
-    rm -f "$test_log"
+    merge_config "$new_cfg"
+    rm -f "$new_cfg"
     save_info
     log "配置写入并校验通过：${CONFIG_FILE}"
 }
 
 # 保存节点元信息，供管理菜单读取（隧道类型、域名等）
 save_info() {
+    install -d -m 755 -o root -g root "$NODES_DIR"
     {
         printf 'MODE=tunnel\n'
         printf 'TUNNEL_TYPE=%s\n' "$TUNNEL_TYPE"
@@ -361,8 +402,12 @@ save_info() {
         printf 'WS_PATH=%s\n' "$WS_PATH"
         printf 'TUNNEL_DOMAIN=%s\n' "$TUNNEL_DOMAIN"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
-    } > "$INFO_FILE"
-    chmod 600 "$INFO_FILE"
+    } > "$NODE_INFO"
+    chmod 600 "$NODE_INFO"
+
+    # 兼容旧版管理菜单：继续写共享元信息文件
+    cp -f "$NODE_INFO" "$INFO_FILE" 2>/dev/null || true
+    chmod 600 "$INFO_FILE" 2>/dev/null || true
 }
 
 # ------------------------------ systemd 服务 ----------------------------------

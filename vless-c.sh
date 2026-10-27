@@ -13,6 +13,11 @@ readonly XRAY_BIN="/usr/local/bin/xray"
 readonly CONFIG_DIR="/usr/local/etc/xray"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
+# 每个节点独立保存元信息，支持多个协议节点并存
+readonly NODES_DIR="${CONFIG_DIR}/nodes"
+readonly TAG_REALITY="vless-reality"
+readonly TAG_WS="vless-ws-tls"
+readonly TAG_TUNNEL="vless-ws-tunnel"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
@@ -169,8 +174,85 @@ run_child() {
     return 0
 }
 
+# ------------------------------ 多节点辅助 ------------------------------------
+# 判断 config.json 中是否存在指定 tag 的 inbound
+inbound_exists() {
+    local tag="$1" count
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    count="$(jq -r --arg tag "$tag" '[.inbounds[]? | select(.tag == $tag)] | length' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ "${count:-0}" -gt 0 ]]
+}
+
+# 从指定 tag 的 inbound 中取字段，path 形如 .port
+inbound_get() {
+    local tag="$1" path="$2"
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    jq -r --arg tag "$tag" "([.inbounds[]? | select(.tag == \$tag)][0])${path} // empty" "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# 节点元信息文件路径
+node_info_file() { printf '%s/%s.info' "$NODES_DIR" "$1"; }
+
+# 读取节点元信息（优先 nodes/<tag>.info，旧版单节点回退共享文件）
+read_node_value() {
+    local tag="$1" key="$2" f mode
+    f="$(node_info_file "$tag")"
+    if [[ -f "$f" ]]; then
+        sed -n "s/^${key}=//p" "$f" | head -n 1
+        return 0
+    fi
+    case "$tag" in
+        "$TAG_REALITY") mode="reality" ;;
+        "$TAG_WS")      mode="ws" ;;
+        "$TAG_TUNNEL")  mode="tunnel" ;;
+        *) return 1 ;;
+    esac
+    if [[ -f "$INFO_FILE" ]] && [[ "$(detect_mode)" == "$mode" ]]; then
+        sed -n "s/^${key}=//p" "$INFO_FILE" | head -n 1
+        return 0
+    fi
+    return 1
+}
+
+# 更新节点元信息键值（文件不存在时返回失败）
+write_node_value() {
+    local tag="$1" key="$2" value="$3" f
+    f="$(node_info_file "$tag")"
+    [[ -f "$f" ]] || return 1
+    value="${value//|/\\|}"
+    value="${value//&/\\&}"
+    if grep -q "^${key}=" "$f"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$f"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$f"
+    fi
+    chmod 600 "$f" 2>/dev/null || true
+    return 0
+}
+
+# tag → 中文描述
+tag_desc() {
+    case "$1" in
+        "$TAG_REALITY") printf 'VLESS + Reality' ;;
+        "$TAG_WS")      printf 'VLESS + WS + TLS' ;;
+        "$TAG_TUNNEL")  printf 'VLESS + WS + CF Tunnel' ;;
+        *)              printf '%s' "$1" ;;
+    esac
+}
+
+# 列出已安装的 Xray 节点 tag（固定顺序）
+xray_node_tags() {
+    local t
+    for t in "$TAG_REALITY" "$TAG_WS" "$TAG_TUNNEL"; do
+        if inbound_exists "$t"; then
+            printf '%s\n' "$t"
+        fi
+    done
+}
+
 # ------------------------------ 模式检测 --------------------------------------
-# 输出 reality / ws / unknown / none
+# 输出 reality / ws / tunnel / unknown / none（多节点时返回第一个已安装模式）
 detect_mode() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         printf 'none'
@@ -178,6 +260,20 @@ detect_mode() {
     fi
     command -v jq >/dev/null 2>&1 || { printf 'unknown'; return 0; }
 
+    if inbound_exists "$TAG_REALITY"; then
+        printf 'reality'
+        return 0
+    fi
+    if inbound_exists "$TAG_WS"; then
+        printf 'ws'
+        return 0
+    fi
+    if inbound_exists "$TAG_TUNNEL"; then
+        printf 'tunnel'
+        return 0
+    fi
+
+    # 兼容旧版无 tag 配置
     local sec net
     sec="$(jq -r '.inbounds[0].streamSettings.security // empty' "$CONFIG_FILE" 2>/dev/null || true)"
     net="$(jq -r '.inbounds[0].streamSettings.network // empty' "$CONFIG_FILE" 2>/dev/null || true)"
@@ -222,10 +318,8 @@ print_qr() {
 
 # ------------------------------ 安装入口 --------------------------------------
 install_reality() {
-    local cur
-    cur="$(detect_mode)"
-    if [[ "$cur" == "ws" || "$cur" == "tunnel" ]]; then
-        warn "当前为 ${cur} 模式，继续安装 Reality 会覆盖现有配置"
+    if inbound_exists "$TAG_REALITY"; then
+        warn "已安装 Reality 节点，继续安装将覆盖该节点（其他节点不受影响）"
         local ans
         read -r -p "确认覆盖？[y/N]：" ans
         case "$ans" in
@@ -237,10 +331,8 @@ install_reality() {
 }
 
 install_ws() {
-    local cur
-    cur="$(detect_mode)"
-    if [[ "$cur" != "none" && "$cur" != "unknown" ]]; then
-        warn "当前为 ${cur} 模式，继续安装 WS+TLS 会覆盖现有配置"
+    if inbound_exists "$TAG_WS"; then
+        warn "已安装 WS+TLS 节点，继续安装将覆盖该节点（其他节点不受影响）"
         local ans
         read -r -p "确认覆盖？[y/N]：" ans
         case "$ans" in
@@ -252,10 +344,8 @@ install_ws() {
 }
 
 install_tunnel() {
-    local cur
-    cur="$(detect_mode)"
-    if [[ "$cur" != "none" && "$cur" != "unknown" ]]; then
-        warn "当前为 ${cur} 模式，继续安装 CF Tunnel 会覆盖现有配置"
+    if inbound_exists "$TAG_TUNNEL"; then
+        warn "已安装 CF Tunnel 节点，继续安装将覆盖该节点（其他节点不受影响）"
         local ans
         read -r -p "确认覆盖？[y/N]：" ans
         case "$ans" in
@@ -343,22 +433,18 @@ update_hysteria2_info() {
 
 # ------------------------------ 查看节点信息 ----------------------------------
 load_reality() {
-    [[ -f "$CONFIG_FILE" ]] || return 1
-    R_PORT="$(jq -r '.inbounds[0].port // empty' "$CONFIG_FILE")"
-    R_UUID="$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$CONFIG_FILE")"
-    R_SNI="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$CONFIG_FILE")"
-    R_PRIVATE_KEY="$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$CONFIG_FILE")"
-    R_SHORT_ID="$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$CONFIG_FILE")"
+    inbound_exists "$TAG_REALITY" || return 1
+    R_PORT="$(inbound_get "$TAG_REALITY" '.port')"
+    R_UUID="$(inbound_get "$TAG_REALITY" '.settings.clients[0].id')"
+    R_SNI="$(inbound_get "$TAG_REALITY" '.streamSettings.realitySettings.serverNames[0]')"
+    R_PRIVATE_KEY="$(inbound_get "$TAG_REALITY" '.streamSettings.realitySettings.privateKey')"
+    R_SHORT_ID="$(inbound_get "$TAG_REALITY" '.streamSettings.realitySettings.shortIds[0]')"
 
     [[ -n "$R_PORT" && -n "$R_UUID" && -n "$R_SNI" && -n "$R_PRIVATE_KEY" && -n "$R_SHORT_ID" ]] || return 1
 
     # 优先读取安装时保存的公钥与节点名称
-    R_PUBLIC_KEY=""
-    R_NODE_NAME=""
-    if [[ -f "$INFO_FILE" ]]; then
-        R_PUBLIC_KEY="$(read_info_value PUBLIC_KEY || true)"
-        R_NODE_NAME="$(read_info_value NODE_NAME || true)"
-    fi
+    R_PUBLIC_KEY="$(read_node_value "$TAG_REALITY" PUBLIC_KEY || true)"
+    R_NODE_NAME="$(read_node_value "$TAG_REALITY" NODE_NAME || true)"
     [[ -n "$R_NODE_NAME" ]] || R_NODE_NAME="cgg-vless"
 
     # 元信息缺失时由私钥反推公钥
@@ -373,9 +459,10 @@ load_reality() {
 }
 
 show_info_reality() {
-    local link ip
+    local link ip node_name
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="vless://${R_UUID}@${ip}:${R_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${R_SNI}&fp=chrome&pbk=${R_PUBLIC_KEY}&sid=${R_SHORT_ID}&type=tcp&headerType=none#cgg-vless"
+    node_name="${R_NODE_NAME:-cgg-vless}"
+    link="vless://${R_UUID}@${ip}:${R_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${R_SNI}&fp=chrome&pbk=${R_PUBLIC_KEY}&sid=${R_SHORT_ID}&type=tcp&headerType=none#${node_name}"
 
     printf '\n%s=============== cgg-vless Reality 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + Reality\n'
@@ -410,10 +497,14 @@ extract_cert_domain() {
 }
 
 show_info_ws() {
-    local port uuid path domain link ip enc_path
-    port="$(jq -r '.inbounds[0].port // empty' "$CONFIG_FILE")"
-    uuid="$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$CONFIG_FILE")"
-    path="$(jq -r '.inbounds[0].streamSettings.wsSettings.path // empty' "$CONFIG_FILE")"
+    local port uuid path domain link ip enc_path node_name
+    if ! inbound_exists "$TAG_WS"; then
+        err "未找到 WS+TLS 节点配置"
+        return 1
+    fi
+    port="$(inbound_get "$TAG_WS" '.port')"
+    uuid="$(inbound_get "$TAG_WS" '.settings.clients[0].id')"
+    path="$(inbound_get "$TAG_WS" '.streamSettings.wsSettings.path')"
 
     if [[ -z "$port" || -z "$uuid" || -z "$path" ]]; then
         err "配置读取不完整，无法生成链接"
@@ -421,7 +512,7 @@ show_info_ws() {
     fi
 
     # 优先使用安装时记录的域名，避免证书为泛域名时无法作为 SNI
-    domain="$(read_info_value DOMAIN || true)"
+    domain="$(read_node_value "$TAG_WS" DOMAIN || true)"
     if [[ -z "$domain" ]]; then
         domain="$(extract_cert_domain || true)"
     fi
@@ -432,7 +523,7 @@ show_info_ws() {
 
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
     enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
-    node_name="$(read_info_value NODE_NAME || true)"
+    node_name="$(read_node_value "$TAG_WS" NODE_NAME || true)"
     [[ -n "$node_name" ]] || node_name="cgg-vless-ws"
     link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#${node_name}"
 
@@ -453,19 +544,23 @@ show_info_ws() {
 # 隧道模式（VLESS + WS + CF Tunnel）节点信息
 show_info_tunnel() {
     local port uuid path domain link node_name ttype latest enc_path
-    port="$(jq -r '.inbounds[0].port // empty' "$CONFIG_FILE")"
-    uuid="$(jq -r '.inbounds[0].settings.clients[0].id // empty' "$CONFIG_FILE")"
-    path="$(jq -r '.inbounds[0].streamSettings.wsSettings.path // empty' "$CONFIG_FILE")"
+    if ! inbound_exists "$TAG_TUNNEL"; then
+        err "未找到 CF Tunnel 节点配置"
+        return 1
+    fi
+    port="$(inbound_get "$TAG_TUNNEL" '.port')"
+    uuid="$(inbound_get "$TAG_TUNNEL" '.settings.clients[0].id')"
+    path="$(inbound_get "$TAG_TUNNEL" '.streamSettings.wsSettings.path')"
 
     if [[ -z "$port" || -z "$uuid" || -z "$path" ]]; then
         err "配置读取不完整，无法生成链接"
         return 1
     fi
 
-    ttype="$(read_info_value TUNNEL_TYPE || true)"
-    node_name="$(read_info_value NODE_NAME || true)"
+    ttype="$(read_node_value "$TAG_TUNNEL" TUNNEL_TYPE || true)"
+    node_name="$(read_node_value "$TAG_TUNNEL" NODE_NAME || true)"
     [[ -n "$node_name" ]] || node_name="cgg-vless-tunnel"
-    domain="$(read_info_value TUNNEL_DOMAIN || true)"
+    domain="$(read_node_value "$TAG_TUNNEL" TUNNEL_DOMAIN || true)"
 
     # 临时隧道重启后域名会变化，优先读取服务日志中的最新域名
     if [[ "$ttype" == "quick" ]]; then
@@ -473,7 +568,9 @@ show_info_tunnel() {
             | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
         if [[ -n "$latest" && "${latest#https://}" != "$domain" ]]; then
             domain="${latest#https://}"
-            update_info_value TUNNEL_DOMAIN "$domain"
+            if ! write_node_value "$TAG_TUNNEL" TUNNEL_DOMAIN "$domain"; then
+                update_info_value TUNNEL_DOMAIN "$domain"
+            fi
             warn "临时隧道域名已更新，客户端请重新获取"
         fi
     fi
@@ -602,39 +699,46 @@ show_info() {
     local shown=0 mode
     SERVER_IP="$(get_public_ip)"
 
-    if [[ -f "$CONFIG_FILE" ]]; then
-        mode="$(detect_mode)"
-        case "$mode" in
-            reality)
-                if ! load_reality; then
-                    err "Reality 配置读取失败，可能配置不完整"
-                    return 1
-                fi
-                show_info_reality
-                ;;
-            ws)
-                show_info_ws
-                ;;
-            tunnel)
-                show_info_tunnel
-                ;;
-            unknown)
-                err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel）"
-                return 1
-                ;;
-            *)
-                err "未找到有效配置"
-                return 1
-                ;;
-        esac
-        shown=1
+    # Xray 支持多 inbound，逐个节点输出链接
+    if inbound_exists "$TAG_REALITY"; then
+        if load_reality; then
+            show_info_reality
+            shown=1
+        else
+            err "Reality 配置读取失败，可能配置不完整"
+        fi
+    fi
 
+    if inbound_exists "$TAG_WS"; then
+        if show_info_ws; then
+            shown=1
+        fi
+    fi
+
+    if inbound_exists "$TAG_TUNNEL"; then
+        if show_info_tunnel; then
+            shown=1
+        fi
+    fi
+
+    if (( shown == 1 )); then
         if systemctl is-active --quiet xray 2>/dev/null; then
             log "Xray 服务状态：运行中"
         else
             warn "Xray 服务状态：未运行"
         fi
         printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$CONFIG_FILE" "$C_RESET"
+    elif [[ -f "$CONFIG_FILE" ]]; then
+        mode="$(detect_mode)"
+        case "$mode" in
+            unknown)
+                err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel）"
+                return 1
+                ;;
+            *)
+                err "未找到有效配置"
+                ;;
+        esac
     fi
 
     # AnyTLS 与 Xray 并存时一并显示
@@ -745,15 +849,24 @@ service_action() {
 
 # ------------------------------ 修改 Reality 配置 -----------------------------
 save_reality_info() {
+    local nf
     install -d -m 755 -o root -g root "$CONFIG_DIR"
+    install -d -m 755 -o root -g root "$NODES_DIR"
+    nf="$(node_info_file "$TAG_REALITY")"
     {
+        printf 'MODE=reality\n'
         printf 'PORT=%s\n' "$R_PORT"
         printf 'UUID=%s\n' "$R_UUID"
         printf 'SNI=%s\n' "$R_SNI"
         printf 'PUBLIC_KEY=%s\n' "$R_PUBLIC_KEY"
         printf 'SHORT_ID=%s\n' "$R_SHORT_ID"
-    } > "$INFO_FILE"
-    chmod 600 "$INFO_FILE"
+        printf 'NODE_NAME=%s\n' "${R_NODE_NAME:-cgg-vless}"
+    } > "$nf"
+    chmod 600 "$nf"
+
+    # 兼容旧版管理菜单：继续写共享元信息文件
+    cp -f "$nf" "$INFO_FILE" 2>/dev/null || true
+    chmod 600 "$INFO_FILE" 2>/dev/null || true
 }
 
 restart_after_change() {
@@ -790,9 +903,11 @@ change_sni() {
     fi
 
     tmp="$(mktemp)"
-    if ! jq --arg sni "$input" '
-        .inbounds[0].streamSettings.realitySettings.dest = ($sni + ":443")
-        | .inbounds[0].streamSettings.realitySettings.serverNames = [$sni]
+    if ! jq --arg sni "$input" --arg tag "$TAG_REALITY" '
+        .inbounds = [.inbounds[] | if .tag == $tag then
+            .streamSettings.realitySettings.dest = ($sni + ":443")
+            | .streamSettings.realitySettings.serverNames = [$sni]
+        else . end]
     ' "$CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         err "生成新配置失败"
@@ -833,8 +948,11 @@ reset_uuid() {
     [[ -n "$new_uuid" ]] || { err "UUID 生成失败"; return 1; }
 
     tmp="$(mktemp)"
-    if ! jq --arg id "$new_uuid" '.inbounds[0].settings.clients[0].id = $id' \
-        "$CONFIG_FILE" > "$tmp"; then
+    if ! jq --arg id "$new_uuid" --arg tag "$TAG_REALITY" '
+        .inbounds = [.inbounds[] | if .tag == $tag then
+            .settings.clients[0].id = $id
+        else . end]
+    ' "$CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         err "生成新配置失败"
         return 1
@@ -856,25 +974,58 @@ reset_uuid() {
     restart_after_change
 }
 
-# 修改节点名称（Reality / WS 均可用）
-change_node_name() {
-    local mode current input
-    mode="$(detect_mode)"
+# 选择要操作的 Xray 节点，结果写入 SELECTED_TAG
+select_xray_node() {
+    local tags=() t choice i=1
+    while IFS= read -r t; do
+        [[ -n "$t" ]] && tags+=("$t")
+    done < <(xray_node_tags)
 
-    case "$mode" in
-        reality)
+    if (( ${#tags[@]} == 0 )); then
+        err "未找到 Xray 节点，请先执行安装"
+        return 1
+    fi
+    if (( ${#tags[@]} == 1 )); then
+        SELECTED_TAG="${tags[0]}"
+        return 0
+    fi
+
+    printf '\n请选择要操作的节点：\n'
+    for t in "${tags[@]}"; do
+        printf '  %d) %s\n' "$i" "$(tag_desc "$t")"
+        i=$((i + 1))
+    done
+    read -r -p "请选择 [1-${#tags[@]}]：" choice || return 1
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( 10#$choice < 1 || 10#$choice > ${#tags[@]} )); then
+        err "无效选项：${choice}"
+        return 1
+    fi
+    SELECTED_TAG="${tags[$((10#$choice - 1))]}"
+    return 0
+}
+
+# 修改节点名称（Reality / WS 均可用，多节点时先选择节点）
+change_node_name() {
+    local current input tag
+    if ! select_xray_node; then
+        return 1
+    fi
+    tag="$SELECTED_TAG"
+
+    case "$tag" in
+        "$TAG_REALITY")
             if ! load_reality; then
                 err "Reality 配置读取失败，请先执行安装"
                 return 1
             fi
             current="$R_NODE_NAME"
             ;;
-        ws)
-            current="$(read_info_value NODE_NAME || true)"
+        "$TAG_WS")
+            current="$(read_node_value "$TAG_WS" NODE_NAME || true)"
             [[ -n "$current" ]] || current="cgg-vless-ws"
             ;;
-        tunnel)
-            current="$(read_info_value NODE_NAME || true)"
+        "$TAG_TUNNEL")
+            current="$(read_node_value "$TAG_TUNNEL" NODE_NAME || true)"
             [[ -n "$current" ]] || current="cgg-vless-tunnel"
             ;;
         *)
@@ -889,20 +1040,27 @@ change_node_name() {
     input="${input// /_}"
     [[ -n "$input" ]] || { warn "输入为空，已取消"; return 1; }
 
-    update_info_value NODE_NAME "$input"
+    if ! write_node_value "$tag" NODE_NAME "$input"; then
+        # 旧版单节点没有独立元信息文件，回退写入共享文件
+        update_info_value NODE_NAME "$input"
+    fi
     log "节点名称已更新为：${input}"
 
     # 名称仅影响分享链接备注，无需重启服务
     SERVER_IP="$(get_public_ip)"
-    if [[ "$mode" == "reality" ]]; then
-        if load_reality; then
-            show_info_reality
-        fi
-    elif [[ "$mode" == "tunnel" ]]; then
-        show_info_tunnel
-    else
-        show_info_ws
-    fi
+    case "$tag" in
+        "$TAG_REALITY")
+            if load_reality; then
+                show_info_reality
+            fi
+            ;;
+        "$TAG_TUNNEL")
+            show_info_tunnel
+            ;;
+        *)
+            show_info_ws
+            ;;
+    esac
 }
 
 # 修改 AnyTLS 节点名称（仅影响分享链接备注，无需重启）
@@ -948,13 +1106,11 @@ change_hysteria2_node_name() {
 }
 
 modify_menu() {
-    local mode choice
-    mode="$(detect_mode)"
+    local choice tags title t
+    tags="$(xray_node_tags)"
 
     local has_xray=0 has_anytls=0 has_hs2=0
-    if [[ "$mode" == "reality" || "$mode" == "ws" || "$mode" == "tunnel" ]]; then
-        has_xray=1
-    fi
+    [[ -n "$tags" ]] && has_xray=1
     [[ -f "$ANYTLS_CONFIG" ]] && has_anytls=1
     [[ -f "$HS2_CONFIG" ]] && has_hs2=1
 
@@ -964,27 +1120,25 @@ modify_menu() {
     fi
 
     while true; do
-        local title="$mode"
+        title=""
+        if [[ -n "$tags" ]]; then
+            while IFS= read -r t; do
+                [[ -n "$t" ]] || continue
+                title="${title:+${title} + }$(tag_desc "$t")"
+            done <<< "$tags"
+        fi
         if (( has_anytls == 1 )); then
-            if (( has_xray == 1 )); then
-                title="${mode} + anytls"
-            else
-                title="anytls"
-            fi
+            title="${title:+${title} + }anytls"
         fi
         if (( has_hs2 == 1 )); then
-            if (( has_xray == 1 || has_anytls == 1 )); then
-                title="${title} + hysteria2"
-            else
-                title="hysteria2"
-            fi
+            title="${title:+${title} + }hysteria2"
         fi
-        printf '\n%s-------- 修改配置（当前模式：%s）--------%s\n' "$C_CYAN" "$title" "$C_RESET"
+        printf '\n%s-------- 修改配置（当前节点：%s）--------%s\n' "$C_CYAN" "$title" "$C_RESET"
         if (( has_xray == 1 )); then
             printf '  1) 修改节点名称\n'
-            if [[ "$mode" == "reality" ]]; then
-                printf '  2) 更换伪装域名 SNI\n'
-                printf '  3) 重置 UUID\n'
+            if inbound_exists "$TAG_REALITY"; then
+                printf '  2) 更换伪装域名 SNI（Reality）\n'
+                printf '  3) 重置 UUID（Reality）\n'
             fi
         fi
         if (( has_anytls == 1 )); then
@@ -1007,16 +1161,14 @@ modify_menu() {
                 fi
                 ;;
             2)
-                if (( has_xray == 1 )) && [[ "$mode" == "reality" ]]; then
+                if inbound_exists "$TAG_REALITY"; then
                     change_sni || true
-                elif (( has_xray == 1 )); then
-                    warn "WS+TLS 模式不支持修改 SNI"
                 else
-                    warn "无效选项：${choice}"
+                    warn "未安装 Reality 节点，无法修改 SNI"
                 fi
                 ;;
             3)
-                if (( has_xray == 1 )) && [[ "$mode" == "reality" ]]; then
+                if inbound_exists "$TAG_REALITY"; then
                     reset_uuid || true
                 else
                     warn "无效选项：${choice}"
@@ -1552,15 +1704,22 @@ EOF
 
 # ------------------------------ 菜单 ------------------------------------------
 show_menu() {
-    local mode mode_desc
-    mode="$(detect_mode)"
-    case "$mode" in
-        reality) mode_desc="${C_GREEN}VLESS + Reality${C_RESET}" ;;
-        ws)      mode_desc="${C_GREEN}VLESS + WS + TLS${C_RESET}" ;;
-        tunnel)  mode_desc="${C_GREEN}VLESS + WS + CF Tunnel${C_RESET}" ;;
-        none)    mode_desc="${C_YELLOW}未安装${C_RESET}" ;;
-        *)       mode_desc="${C_YELLOW}未知${C_RESET}" ;;
-    esac
+    local mode mode_desc tags t
+    tags="$(xray_node_tags)"
+
+    if [[ -n "$tags" ]]; then
+        mode_desc=""
+        while IFS= read -r t; do
+            [[ -n "$t" ]] || continue
+            mode_desc="${mode_desc:+${mode_desc} + }${C_GREEN}$(tag_desc "$t")${C_RESET}"
+        done <<< "$tags"
+    else
+        mode="$(detect_mode)"
+        case "$mode" in
+            none) mode_desc="${C_YELLOW}未安装${C_RESET}" ;;
+            *)    mode_desc="${C_YELLOW}未知${C_RESET}" ;;
+        esac
+    fi
     # AnyTLS 使用独立 sing-box 后端，可与 Xray 任意模式并存
     if [[ -f "$ANYTLS_CONFIG" ]]; then
         mode_desc="${mode_desc}${C_CYAN} + AnyTLS${C_RESET}"
@@ -1571,7 +1730,7 @@ show_menu() {
     fi
 
     printf '%s==================== cgg-vless 总菜单 ====================%s\n' "$C_MAGENTA" "$C_RESET"
-    printf '  当前模式：%b\n' "$mode_desc"
+    printf '  当前节点：%b\n' "$mode_desc"
     printf '  1) 安装 VLESS-Reality 节点\n'
     printf '  2) 安装 VLESS + WS + TLS 节点（CDN）\n'
     printf '  3) 安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）\n'
