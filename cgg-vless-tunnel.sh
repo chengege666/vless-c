@@ -530,7 +530,7 @@ print_result() {
     local link enc_path
 
     if [[ -z "$TUNNEL_DOMAIN" ]]; then
-        warn "尚未记录隧道域名，链接中域名为占位符，配置好后请在总菜单 5 中重新查看"
+        warn "尚未记录隧道域名，链接中域名为占位符，配置好后请在总菜单 6 中重新查看"
         TUNNEL_DOMAIN="YOUR_TUNNEL_DOMAIN"
     fi
 
@@ -550,7 +550,7 @@ print_result() {
     printf '%s==========================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
     if [[ "$TUNNEL_TYPE" == "quick" ]]; then
-        printf '%s临时隧道：域名每次重启都会变化，总菜单 5 重新查看可获取最新域名；仅建议测试使用。%s\n' "$C_YELLOW" "$C_RESET"
+        printf '%s临时隧道：域名每次重启都会变化，总菜单 6 重新查看可获取最新域名；仅建议测试使用。%s\n' "$C_YELLOW" "$C_RESET"
     else
         printf '%s固定隧道：如尚未在网页端配置，请按上方提示添加 Public Hostname（Type: HTTP → URL: http://localhost:%s，需带 http:// 协议头）。%s\n' "$C_YELLOW" "$LOCAL_PORT" "$C_RESET"
     fi

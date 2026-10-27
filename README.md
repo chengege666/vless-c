@@ -57,7 +57,7 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 
 固定隧道网页端配置：**Zero Trust → Networks → Tunnels → Public Hostname**，Type 选 **HTTP**，URL 填 `http://localhost:本地端口`（默认 8001，必须带 `http://` 协议头），保存后 DNS 记录自动创建。
 
-临时隧道域名重启后会变化，用总菜单第 `5` 项重新查看即可获取最新域名；仅建议测试使用。
+临时隧道域名重启后会变化，用总菜单第 `6` 项重新查看即可获取最新域名；仅建议测试使用。
 
 
 ## AnyTLS + TLS 模式（总菜单第 4 项）
@@ -76,7 +76,7 @@ Xray-core 不支持 AnyTLS，该模式由脚本安装 **独立 sing-box 后端**
 安装时会自动生成 32 位十六进制密码，完成后输出 `anytls://` 链接与二维码；NAT 机需在服务商面板把外部端口映射到相同内部端口。
 
 
-## Hysteria 2 模式（总菜单第 14 项）
+## Hysteria 2 模式（总菜单第 5 项）
 
 Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安装 **sing-box 后端**；配置 `hysteria2.json`、服务 `cgg-hysteria2`、元信息均与 Xray / AnyTLS 分离，可与现有节点并存。
 
@@ -113,9 +113,9 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 | `/usr/local/etc/sing-box/cgg-hysteria2.info` | Hysteria 2 元信息（含密码，权限 600） |
 | `/usr/local/etc/sing-box/cert-hysteria2/` | Hysteria 2 手动证书副本（Hysteria 2 模式） |
 | `/etc/systemd/system/cgg-hysteria2.service` | Hysteria 2 服务（Hysteria 2 模式） |
-| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 13 项） |
-| `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 13 项） |
-| `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 12 项） |
+| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 14 项） |
+| `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 14 项） |
+| `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 13 项） |
 | `/opt/cgg-vless/` | 总菜单下载的子脚本缓存 |
 | `/root/.acme.sh/` | acme.sh 及自动续期任务 |
 
@@ -139,7 +139,7 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
    - 监听端口在 Cloudflare 支持列表内（443 / 2053 / 2083 / 2087 / 2096 / 8443）→ 客户端直接用该端口连接，无需额外配置
    - 监听端口不在列表内 → 在 Cloudflare 的 **Origin Rules** 新建规则，将回源端口（Destination Port）改为监听端口，客户端端口填 443
 4. 证书申请：NAT 机通常没有 80 端口，HTTP-01 会失败，改用以下方式之一：
-   - DNS-01 验证（总菜单 `10` → `3`，支持 Cloudflare / 阿里云）
+   - DNS-01 验证（总菜单 `11` → `3`，支持 Cloudflare / 阿里云）
    - 使用本机已有证书文件（证书来源选 `2`，直接填 `.cer` / `.key` 路径）
    - 使用已安装到 `/usr/local/etc/xray/cert` 的证书（证书来源选 `3`）
 
@@ -151,15 +151,15 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 修改配置：
 
-- 所有模式均可在总菜单第 `9` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 已安装时该菜单额外提供对应的节点名称修改项
+- 所有模式均可在总菜单第 `10` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 已安装时该菜单额外提供对应的节点名称修改项
 - Reality：同一菜单可更换 SNI 或重置 UUID
 - WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
 彻底卸载：
 
-- 总菜单第 `11` 项，输入 `yes` 确认
+- 总菜单第 `12` 项，输入 `yes` 确认
 - 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS / Hysteria 2（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
-- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 10 项 → 8
+- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 11 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
 ```bash
