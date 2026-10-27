@@ -1494,6 +1494,249 @@ cert_menu() {
     done
 }
 
+# ------------------------------ 卸载指定节点 ----------------------------------
+# 收集可卸载节点，每行格式：类型|tag|描述
+uninstall_node_choices() {
+    local t
+    while IFS= read -r t; do
+        [[ -n "$t" ]] || continue
+        printf 'xray|%s|%s\n' "$t" "$(tag_desc "$t")"
+    done < <(xray_node_tags)
+
+    if [[ -f "$ANYTLS_CONFIG" ]]; then
+        printf 'anytls|anytls|AnyTLS + TLS\n'
+    fi
+    if [[ -f "$HS2_CONFIG" ]]; then
+        printf 'hysteria2|hysteria2|Hysteria 2\n'
+    fi
+}
+
+# 删除 CF Tunnel 对应的隧道服务（保留 cloudflared 主程序）
+remove_tunnel_service() {
+    local ttype="$1" ans svc list=() found=0 removed=0
+
+    if [[ "$ttype" == "quick" ]]; then
+        list=("cgg-quick-tunnel")
+    else
+        list=("cloudflared" "cloudflared-update")
+    fi
+
+    for svc in "${list[@]}"; do
+        if systemctl cat "$svc" >/dev/null 2>&1 || [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+            found=1
+        fi
+    done
+    if (( found == 0 )); then
+        warn "未找到隧道服务，跳过清理"
+        return 0
+    fi
+
+    warn "将停止并删除隧道服务：${list[*]}"
+    warn "若本机还有其他项目使用同名服务，请先确认"
+    read -r -p "确认删除隧道服务？[y/N]：" ans
+    case "$ans" in
+        [Yy]*) ;;
+        *) warn "已跳过隧道服务清理，请手动处理"; return 0 ;;
+    esac
+
+    for svc in "${list[@]}"; do
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+        if [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+            rm -f "/etc/systemd/system/${svc}.service"
+            removed=1
+        fi
+    done
+
+    if (( removed == 1 )); then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed >/dev/null 2>&1 || true
+        log "隧道服务已删除（cloudflared 主程序保留）"
+    fi
+    return 0
+}
+
+# 卸载单个 Xray 节点：只删除对应 inbound 与元信息，其他节点保持不变
+remove_xray_node() {
+    local tag="$1" tmp backup tunnel_type ans cfg_group remaining
+
+    command -v jq >/dev/null 2>&1 || { err "缺少 jq，无法修改配置"; return 1; }
+    [[ -x "$XRAY_BIN" ]] || { err "未找到 Xray 可执行文件：${XRAY_BIN}"; return 1; }
+    if ! inbound_exists "$tag"; then
+        err "未找到节点配置：$(tag_desc "$tag")"
+        return 1
+    fi
+
+    read -r -p "确认卸载「$(tag_desc "$tag")」节点？该操作不可恢复 [yes/N]：" ans
+    if [[ "$ans" != "yes" ]]; then
+        warn "已取消"
+        return 1
+    fi
+
+    # 隧道节点需要按安装时记录的类型清理对应服务
+    if [[ "$tag" == "$TAG_TUNNEL" ]]; then
+        tunnel_type="$(read_node_value "$TAG_TUNNEL" TUNNEL_TYPE || true)"
+        [[ -n "$tunnel_type" ]] || tunnel_type="fixed"
+    fi
+
+    backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -a "$CONFIG_FILE" "$backup"; then
+        err "备份配置失败，已中止"
+        return 1
+    fi
+
+    # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
+    if ! jq --arg tag "$tag" '.inbounds = [.inbounds[]? | select(.tag != $tag)]' \
+        "$CONFIG_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        err "生成新配置失败，已保留原配置（备份：${backup}）"
+        return 1
+    fi
+
+    if ! "$XRAY_BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        err "新配置校验失败，已保留原配置（备份：${backup}）"
+        return 1
+    fi
+
+    # 保留原配置的属组，避免 Xray 以 nobody 运行时无法读取
+    cfg_group="root"
+    cfg_group="$(stat -c '%G' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$cfg_group" ]] || cfg_group="root"
+    if ! install -m 640 -o root -g "$cfg_group" "$tmp" "$CONFIG_FILE"; then
+        rm -f "$tmp"
+        err "写入配置失败，原配置备份：${backup}"
+        return 1
+    fi
+    rm -f "$tmp"
+    chmod 640 "$CONFIG_FILE" 2>/dev/null || true
+
+    rm -f "$(node_info_file "$tag")"
+    log "已从配置中移除节点：$(tag_desc "$tag")"
+
+    # CF Tunnel 节点需同时清理隧道服务
+    if [[ "$tag" == "$TAG_TUNNEL" ]]; then
+        remove_tunnel_service "$tunnel_type"
+    fi
+
+    remaining="$(xray_node_tags || true)"
+    if [[ -z "$remaining" ]]; then
+        # 最后一个 Xray 节点：停止并移除服务，保留二进制、日志与配置文件
+        systemctl stop xray >/dev/null 2>&1 || true
+        systemctl disable xray >/dev/null 2>&1 || true
+        if [[ -f "$SERVICE_FILE" ]]; then
+            rm -f "$SERVICE_FILE"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl reset-failed >/dev/null 2>&1 || true
+        fi
+        log "已无其他 Xray 节点，xray.service 已停止并移除（二进制、日志与配置保留）"
+    else
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if systemctl restart xray && sleep 1 && systemctl is-active --quiet xray; then
+            log "Xray 已重启，剩余节点已生效"
+        else
+            err "Xray 重启失败，可使用备份配置回滚：${backup}"
+            return 1
+        fi
+    fi
+
+    warn "防火墙放行规则未自动删除，如有需要请手动清理"
+}
+
+# 卸载 AnyTLS 节点（sing-box 后端），保留证书目录与 sing-box 主程序
+remove_anytls_node() {
+    local ans
+    if [[ ! -f "$ANYTLS_CONFIG" ]]; then
+        err "未找到 AnyTLS 配置"
+        return 1
+    fi
+
+    read -r -p "确认卸载 AnyTLS 节点？该操作不可恢复 [yes/N]：" ans
+    if [[ "$ans" != "yes" ]]; then
+        warn "已取消"
+        return 1
+    fi
+
+    systemctl stop cgg-anytls >/dev/null 2>&1 || true
+    systemctl disable cgg-anytls >/dev/null 2>&1 || true
+    rm -f "$ANYTLS_SERVICE_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+
+    rm -f "$ANYTLS_CONFIG" "$ANYTLS_INFO"
+    log "AnyTLS 节点已卸载（证书目录与 sing-box 主程序保留）"
+    warn "防火墙放行规则未自动删除，如有需要请手动清理"
+}
+
+# 卸载 Hysteria 2 节点（sing-box 后端），保留证书目录与 sing-box 主程序
+remove_hysteria2_node() {
+    local ans
+    if [[ ! -f "$HS2_CONFIG" ]]; then
+        err "未找到 Hysteria 2 配置"
+        return 1
+    fi
+
+    read -r -p "确认卸载 Hysteria 2 节点？该操作不可恢复 [yes/N]：" ans
+    if [[ "$ans" != "yes" ]]; then
+        warn "已取消"
+        return 1
+    fi
+
+    systemctl stop cgg-hysteria2 >/dev/null 2>&1 || true
+    systemctl disable cgg-hysteria2 >/dev/null 2>&1 || true
+    rm -f "$HS2_SERVICE_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+
+    rm -f "$HS2_CONFIG" "$HS2_INFO"
+    log "Hysteria 2 节点已卸载（证书目录与 sing-box 主程序保留）"
+    warn "防火墙放行规则未自动删除，如有需要请手动清理"
+}
+
+# 选择并卸载指定节点
+uninstall_node_menu() {
+    local choices=() line kind tag desc choice sel i=1
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && choices+=("$line")
+    done < <(uninstall_node_choices)
+
+    if (( ${#choices[@]} == 0 )); then
+        err "未找到可卸载的节点"
+        return 1
+    fi
+
+    printf '\n%s-------- 卸载指定节点 --------%s\n' "$C_CYAN" "$C_RESET"
+    for line in "${choices[@]}"; do
+        IFS='|' read -r kind tag desc <<< "$line"
+        printf '  %d) %s\n' "$i" "$desc"
+        i=$((i + 1))
+    done
+    printf '  0) 返回主菜单\n'
+
+    if ! read -r -p "请选择要卸载的节点 [0-${#choices[@]}]：" choice; then
+        printf '\n'
+        return 0
+    fi
+    if [[ "$choice" == "0" ]]; then
+        return 0
+    fi
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( 10#$choice < 1 || 10#$choice > ${#choices[@]} )); then
+        warn "无效选项：${choice}"
+        return 1
+    fi
+
+    sel="${choices[$((10#$choice - 1))]}"
+    IFS='|' read -r kind tag desc <<< "$sel"
+    case "$kind" in
+        xray)      remove_xray_node "$tag" || true ;;
+        anytls)    remove_anytls_node || true ;;
+        hysteria2) remove_hysteria2_node || true ;;
+        *)         warn "未知节点类型：${kind}" ;;
+    esac
+}
+
 # ------------------------------ 彻底卸载 --------------------------------------
 uninstall_all() {
     local ans
@@ -1669,7 +1912,7 @@ enable_bbr() {
         fi
         if [[ " $available " != *" bbr "* ]]; then
             err "当前内核不支持 BBR（LXC / OpenVZ 容器常见，由宿主内核决定）"
-            warn "仍可使用菜单 12 的 TCP 窗口调优"
+            warn "仍可使用菜单 14 的 TCP 窗口调优"
             return 1
         fi
     fi
@@ -1744,9 +1987,10 @@ show_menu() {
     printf '  9) 重启 Xray 服务\n'
     printf '  10) 修改配置（节点名称 / SNI / UUID）\n'
     printf '  11) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
-    printf '  12) 一键彻底卸载\n'
-    printf '  13) TCP 窗口调优（无需内核支持）\n'
-    printf '  14) 开启 BBR 加速（需内核支持）\n'
+    printf '  12) 卸载指定节点（Reality / WS / Tunnel / AnyTLS / Hysteria2）\n'
+    printf '  13) 一键彻底卸载\n'
+    printf '  14) TCP 窗口调优（无需内核支持）\n'
+    printf '  15) 开启 BBR 加速（需内核支持）\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -1760,7 +2004,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-14]：" choice; then
+        if ! read -r -p "请选择 [0-15]：" choice; then
             printf '\n'
             return 0
         fi
@@ -1776,9 +2020,10 @@ main_menu() {
             9) service_action restart || true ;;
             10) modify_menu || true ;;
             11) cert_menu ;;
-            12) uninstall_all || true ;;
-            13) enable_tcp_tune || true ;;
-            14) enable_bbr || true ;;
+            12) uninstall_node_menu || true ;;
+            13) uninstall_all || true ;;
+            14) enable_tcp_tune || true ;;
+            15) enable_bbr || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac

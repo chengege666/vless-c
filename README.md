@@ -113,9 +113,9 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 | `/usr/local/etc/sing-box/cgg-hysteria2.info` | Hysteria 2 元信息（含密码，权限 600） |
 | `/usr/local/etc/sing-box/cert-hysteria2/` | Hysteria 2 手动证书副本（Hysteria 2 模式） |
 | `/etc/systemd/system/cgg-hysteria2.service` | Hysteria 2 服务（Hysteria 2 模式） |
-| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 14 项） |
-| `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 14 项） |
-| `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 13 项） |
+| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 15 项） |
+| `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 15 项） |
+| `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 14 项） |
 | `/opt/cgg-vless/` | 总菜单下载的子脚本缓存 |
 | `/root/.acme.sh/` | acme.sh 及自动续期任务 |
 
@@ -155,9 +155,17 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 - Reality：同一菜单可更换 SNI 或重置 UUID
 - WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
+卸载指定节点：
+
+- 总菜单第 `12` 项，选择要卸载的节点后输入 `yes` 确认
+- 仅删除该节点的配置、元信息与对应服务，其他节点不受影响
+- 删除最后一个 Xray 节点时会停止并移除 `xray.service`，保留二进制、日志与配置文件
+- CF Tunnel 节点会额外确认是否删除 `cloudflared` / `cgg-quick-tunnel` 服务（保留 cloudflared 主程序）
+- **不会**删除证书目录与 Xray / sing-box 主程序
+
 彻底卸载：
 
-- 总菜单第 `12` 项，输入 `yes` 确认
+- 总菜单第 `13` 项，输入 `yes` 确认
 - 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS / Hysteria 2（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
 - **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 11 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
