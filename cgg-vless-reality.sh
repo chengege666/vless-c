@@ -420,6 +420,7 @@ write_config() {
             "${SNI}"
           ],
           "privateKey": "${PRIVATE_KEY}",
+          "minClientVer": "1.8.2",
           "shortIds": [
             "${SHORT_ID}"
           ]
