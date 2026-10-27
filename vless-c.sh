@@ -902,7 +902,8 @@ change_sni() {
         return 1
     fi
 
-    tmp="$(mktemp)"
+    # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
     if ! jq --arg sni "$input" --arg tag "$TAG_REALITY" '
         .inbounds = [.inbounds[] | if .tag == $tag then
             .streamSettings.realitySettings.dest = ($sni + ":443")
@@ -947,7 +948,8 @@ reset_uuid() {
     [[ -n "$new_uuid" ]] || new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
     [[ -n "$new_uuid" ]] || { err "UUID 生成失败"; return 1; }
 
-    tmp="$(mktemp)"
+    # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
     if ! jq --arg id "$new_uuid" --arg tag "$TAG_REALITY" '
         .inbounds = [.inbounds[] | if .tag == $tag then
             .settings.clients[0].id = $id

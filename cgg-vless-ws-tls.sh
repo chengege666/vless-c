@@ -524,7 +524,8 @@ gen_ws_path() {
 merge_config() {
     local new_cfg="$1"
     local tmp_cfg test_log
-    tmp_cfg="$(mktemp)"
+    # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
+    tmp_cfg="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
 
     if [[ -f "$CONFIG_FILE" ]] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
         if ! jq --slurpfile new "$new_cfg" --arg tag "$NODE_TAG" '
