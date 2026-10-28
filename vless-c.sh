@@ -260,6 +260,18 @@ detect_mode() {
     fi
     command -v jq >/dev/null 2>&1 || { printf 'unknown'; return 0; }
 
+    # 空 inbounds（例如删除了最后一个 Xray 节点）视为未安装
+    local count
+    count="$(jq -r 'if (.inbounds | type) == "array" then (.inbounds | length) else 0 end' "$CONFIG_FILE" 2>/dev/null || true)"
+    if [[ -z "$count" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+    if (( count == 0 )); then
+        printf 'none'
+        return 0
+    fi
+
     if inbound_exists "$TAG_REALITY"; then
         printf 'reality'
         return 0
@@ -731,9 +743,11 @@ show_info() {
     elif [[ -f "$CONFIG_FILE" ]]; then
         mode="$(detect_mode)"
         case "$mode" in
+            none)
+                # 已无 Xray 节点，继续展示 AnyTLS / Hysteria 2
+                ;;
             unknown)
                 err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel）"
-                return 1
                 ;;
             *)
                 err "未找到有效配置"
