@@ -220,10 +220,12 @@ ask_port() {
     # Xray 配置占用同一端口时，即使服务当前停止也会冲突
     if [[ -f "$XRAY_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
         local xport
-        xport="$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null || true)"
-        if [[ -n "$xport" && "$xport" == "$PORT" ]]; then
-            die "端口 ${PORT} 已被 Xray 配置占用，请为 AnyTLS 选择其他端口"
-        fi
+        while IFS= read -r xport; do
+            [[ -n "$xport" ]] || continue
+            if [[ "$xport" == "$PORT" ]]; then
+                die "端口 ${PORT} 已被 Xray 配置占用，请为 AnyTLS 选择其他端口"
+            fi
+        done < <(jq -r '.inbounds[]? | .port // empty' "$XRAY_CONFIG" 2>/dev/null || true)
     fi
 
     log "监听端口：${PORT}"

@@ -252,6 +252,23 @@ port_config_conflict() {
     return 1
 }
 
+# 端口是否正在被监听
+port_in_use() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+}
+
+# 判断端口是否为当前节点已配置且正在运行的端口（重装时可复用）
+own_running_port() {
+    local port="$1" own
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    own="$(jq -r --arg tag "$NODE_TAG" '[.inbounds[]? | select(.tag == $tag)][0].port // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$own" && "$own" == "$port" ]] || return 1
+    systemctl is-active --quiet xray 2>/dev/null
+}
+
 # ------------------------------ 监听端口 --------------------------------------
 # 默认 443；NAT VPS 可选择服务商分配端口范围内的自定义端口
 ask_listen_port() {
@@ -264,6 +281,13 @@ ask_listen_port() {
     read -r -p "请选择 [1-2]（回车默认 1）：" choice || return 0
     case "${choice:-1}" in
         1)
+            if port_in_use "$LISTEN_PORT"; then
+                if own_running_port "$LISTEN_PORT"; then
+                    warn "端口 ${LISTEN_PORT} 为当前节点正在使用的端口，将继续复用"
+                else
+                    die "端口 ${LISTEN_PORT} 已被占用，请改用自定义端口"
+                fi
+            fi
             if conflict="$(port_config_conflict "$LISTEN_PORT" "$NODE_TAG")"; then
                 die "端口 ${LISTEN_PORT} 已被${conflict}占用，请改用自定义端口"
             fi
@@ -273,6 +297,13 @@ ask_listen_port() {
             read -r -p "请输入监听端口（1-65535）：" input || return 0
             input="${input//[[:space:]]/}"
             if [[ -z "$input" ]]; then
+                if port_in_use "$LISTEN_PORT"; then
+                    if own_running_port "$LISTEN_PORT"; then
+                        warn "端口 ${LISTEN_PORT} 为当前节点正在使用的端口，将继续复用"
+                    else
+                        die "端口 ${LISTEN_PORT} 已被占用，请改用自定义端口"
+                    fi
+                fi
                 if conflict="$(port_config_conflict "$LISTEN_PORT" "$NODE_TAG")"; then
                     die "端口 ${LISTEN_PORT} 已被${conflict}占用，请改用自定义端口"
                 fi
@@ -282,8 +313,12 @@ ask_listen_port() {
             if [[ ! "$input" =~ ^[0-9]+$ ]] || (( 10#$input < 1 || 10#$input > 65535 )); then
                 die "端口不合法：${input}"
             fi
-            if command -v ss >/dev/null 2>&1 && ss -H -ltn "sport = :${input}" 2>/dev/null | grep -q .; then
-                die "端口 ${input} 已被占用，请更换"
+            if port_in_use "$input"; then
+                if own_running_port "$input"; then
+                    warn "端口 ${input} 为当前节点正在使用的端口，将继续复用"
+                else
+                    die "端口 ${input} 已被占用，请更换"
+                fi
             fi
             if conflict="$(port_config_conflict "$input" "$NODE_TAG")"; then
                 die "端口 ${input} 已被${conflict}占用，请更换"

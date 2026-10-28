@@ -175,6 +175,16 @@ port_config_conflict() {
     return 1
 }
 
+# 判断端口是否为当前节点已配置且正在运行的端口（重装时可复用）
+own_running_port() {
+    local port="$1" own
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    own="$(jq -r --arg tag "$NODE_TAG" '[.inbounds[]? | select(.tag == $tag)][0].port // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$own" && "$own" == "$port" ]] || return 1
+    systemctl is-active --quiet xray 2>/dev/null
+}
+
 random_port() {
     local i p
     for i in $(seq 1 30); do
@@ -207,10 +217,17 @@ ask_port() {
     input="${input//[[:space:]]/}"
 
     if [[ -z "$input" ]]; then
+        if conflict="$(port_config_conflict "$default_port" "$NODE_TAG")"; then
+            die "随机端口 ${default_port} 已被${conflict}占用，请手动指定端口"
+        fi
         PORT="$default_port"
     elif [[ "$input" =~ ^[0-9]+$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
         if port_in_use "$input"; then
-            die "端口 ${input} 已被占用，请更换"
+            if own_running_port "$input"; then
+                warn "端口 ${input} 为当前节点正在使用的端口，将继续复用"
+            else
+                die "端口 ${input} 已被占用，请更换"
+            fi
         fi
         if conflict="$(port_config_conflict "$input" "$NODE_TAG")"; then
             die "端口 ${input} 已被${conflict}占用，请更换"

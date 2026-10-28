@@ -301,6 +301,72 @@ detect_mode() {
     fi
 }
 
+# ------------------------------ 旧版配置迁移 ----------------------------------
+# 旧版单节点配置没有 tag，新版菜单依赖 tag 识别节点；
+# 启动时把唯一的无 tag inbound 按安全类型补上 tag，避免菜单显示“未知”或无法卸载
+migrate_legacy_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    jq empty "$CONFIG_FILE" >/dev/null 2>&1 || return 0
+    [[ -x "$XRAY_BIN" ]] || return 0
+
+    local count untagged idx tag sec net tmp backup cfg_group
+    count="$(jq -r 'if (.inbounds | type) == "array" then (.inbounds | length) else 0 end' "$CONFIG_FILE" 2>/dev/null || true)"
+    if [[ ! "$count" =~ ^[0-9]+$ ]] || (( count == 0 )); then
+        return 0
+    fi
+
+    untagged="$(jq -r 'if (.inbounds | type) == "array" then ([.inbounds[] | select((.tag // "") == "")] | length) else 0 end' "$CONFIG_FILE" 2>/dev/null || true)"
+    # 仅处理唯一的无 tag inbound，多个无 tag 时不自动猜测
+    [[ "$untagged" == "1" ]] || return 0
+
+    idx="$(jq -r '[.inbounds | to_entries[] | select((.value.tag // "") == "")][0].key // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$idx" ]] || return 0
+
+    sec="$(jq -r ".inbounds[${idx}].streamSettings.security // empty" "$CONFIG_FILE" 2>/dev/null || true)"
+    net="$(jq -r ".inbounds[${idx}].streamSettings.network // empty" "$CONFIG_FILE" 2>/dev/null || true)"
+    case "${sec}:${net}" in
+        reality:*) tag="$TAG_REALITY" ;;
+        tls:ws)    tag="$TAG_WS" ;;
+        none:ws)   tag="$TAG_TUNNEL" ;;
+        *) return 0 ;;
+    esac
+
+    # 已存在同 tag 节点时不迁移，避免两个同 tag inbound 混淆
+    if [[ "$(jq -r --arg tag "$tag" '[.inbounds[] | select(.tag == $tag)] | length' "$CONFIG_FILE" 2>/dev/null || true)" != "0" ]]; then
+        warn "检测到旧版无 tag 配置，但已存在同类型节点，跳过自动迁移"
+        return 0
+    fi
+
+    backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -a "$CONFIG_FILE" "$backup"; then
+        warn "旧版配置备份失败，跳过自动迁移"
+        return 0
+    fi
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cgg-vless-XXXXXX.json")"
+    if ! jq --argjson idx "$idx" --arg tag "$tag" '.inbounds[$idx].tag = $tag' "$CONFIG_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        warn "旧版配置迁移失败，已保留原配置"
+        return 0
+    fi
+    if ! "$XRAY_BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        warn "旧版配置迁移校验失败，已保留原配置"
+        return 0
+    fi
+
+    cfg_group="$(stat -c '%G' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$cfg_group" ]] || cfg_group="root"
+    if install -m 640 -o root -g "$cfg_group" "$tmp" "$CONFIG_FILE"; then
+        log "已迁移旧版配置：无 tag inbound → ${tag}（备份：${backup}）"
+    else
+        warn "旧版配置写入失败，已保留原配置"
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
 # ------------------------------ 公网 IP ---------------------------------------
 get_public_ip() {
     local ip=""
@@ -757,14 +823,16 @@ show_info() {
 
     # AnyTLS 与 Xray 并存时一并显示
     if [[ -f "$ANYTLS_CONFIG" ]]; then
-        show_info_anytls
-        shown=1
+        if show_info_anytls; then
+            shown=1
+        fi
     fi
 
     # Hysteria 2 与 Xray / AnyTLS 并存时一并显示
     if [[ -f "$HS2_CONFIG" ]]; then
-        show_info_hysteria2
-        shown=1
+        if show_info_hysteria2; then
+            shown=1
+        fi
     fi
 
     if (( shown == 0 )); then
@@ -817,15 +885,11 @@ service_action() {
     fi
 
     if [[ "$action" == "stop" ]]; then
-        if (( has_anytls == 1 && has_hs2 == 1 )); then
-            log "Xray / AnyTLS / Hysteria 2 已停止"
-        elif (( has_anytls == 1 )); then
-            log "Xray / AnyTLS 已停止"
-        elif (( has_hs2 == 1 )); then
-            log "Xray / Hysteria 2 已停止"
-        else
-            log "Xray 已停止"
-        fi
+        local stopped=""
+        (( has_xray == 1 )) && stopped="Xray"
+        (( has_anytls == 1 )) && stopped="${stopped:+${stopped} / }AnyTLS"
+        (( has_hs2 == 1 )) && stopped="${stopped:+${stopped} / }Hysteria 2"
+        log "${stopped} 已停止"
         return 0
     fi
 
@@ -1645,11 +1709,10 @@ remove_xray_node() {
         # 最后一个 Xray 节点：停止并移除服务，保留二进制、日志与配置文件
         systemctl stop xray >/dev/null 2>&1 || true
         systemctl disable xray >/dev/null 2>&1 || true
-        if [[ -f "$SERVICE_FILE" ]]; then
-            rm -f "$SERVICE_FILE"
-            systemctl daemon-reload >/dev/null 2>&1 || true
-            systemctl reset-failed >/dev/null 2>&1 || true
-        fi
+        rm -f "$SERVICE_FILE"
+        rm -rf /etc/systemd/system/xray.service.d
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed >/dev/null 2>&1 || true
         log "已无其他 Xray 节点，xray.service 已停止并移除（二进制、日志与配置保留）"
     else
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1685,6 +1748,8 @@ remove_anytls_node() {
     systemctl reset-failed >/dev/null 2>&1 || true
 
     rm -f "$ANYTLS_CONFIG" "$ANYTLS_INFO"
+    # 配置备份中含明文密码，节点卸载后一并清理
+    rm -f "${ANYTLS_CONFIG}".bak.*
     log "AnyTLS 节点已卸载（证书目录与 sing-box 主程序保留）"
     warn "防火墙放行规则未自动删除，如有需要请手动清理"
 }
@@ -1710,6 +1775,8 @@ remove_hysteria2_node() {
     systemctl reset-failed >/dev/null 2>&1 || true
 
     rm -f "$HS2_CONFIG" "$HS2_INFO"
+    # 配置备份中含明文密码，节点卸载后一并清理
+    rm -f "${HS2_CONFIG}".bak.*
     log "Hysteria 2 节点已卸载（证书目录与 sing-box 主程序保留）"
     warn "防火墙放行规则未自动删除，如有需要请手动清理"
 }
@@ -2020,6 +2087,7 @@ main_menu() {
     show_banner
     check_os
     resolve_script_dir
+    migrate_legacy_config || true
 
     local choice
     while true; do
