@@ -92,32 +92,6 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 安装前会检测 UDP 端口占用，安装后自动放行 UDP 端口并校验监听状态；进程异常退出由 systemd `Restart=on-failure` 自动重连。完成后输出 `hysteria2://` 链接与二维码；NAT 机需在服务商面板把 **UDP** 外部端口映射到相同内部端口。
 
 
-## 输出文件与路径
-
-| 路径 | 内容 |
-|---|---|
-| `/usr/local/bin/xray` | Xray 核心 |
-| `/usr/local/etc/xray/config.json` | 节点配置 |
-| `/usr/local/etc/xray/cgg-vless.info` | 节点元信息（各模式共用，权限 600） |
-| `/usr/local/etc/xray/cert/` | WS+TLS 证书目录 |
-| `/var/log/xray/` | 访问日志与错误日志 |
-| `/etc/systemd/system/xray.service` | systemd 服务 |
-| `/usr/local/bin/cloudflared` | Cloudflare Tunnel 客户端（隧道模式） |
-| `/etc/systemd/system/cgg-quick-tunnel.service` | 临时隧道服务（隧道模式） |
-| `/usr/local/bin/sing-box` | sing-box 核心（AnyTLS / Hysteria 2 共用） |
-| `/usr/local/etc/sing-box/config.json` | AnyTLS 节点配置（AnyTLS 模式） |
-| `/usr/local/etc/sing-box/cgg-anytls.info` | AnyTLS 元信息（含密码，权限 600） |
-| `/usr/local/etc/sing-box/cert/` | AnyTLS 手动证书副本（AnyTLS 模式） |
-| `/etc/systemd/system/cgg-anytls.service` | AnyTLS 服务（AnyTLS 模式） |
-| `/usr/local/etc/sing-box/hysteria2.json` | Hysteria 2 节点配置（Hysteria 2 模式） |
-| `/usr/local/etc/sing-box/cgg-hysteria2.info` | Hysteria 2 元信息（含密码，权限 600） |
-| `/usr/local/etc/sing-box/cert-hysteria2/` | Hysteria 2 手动证书副本（Hysteria 2 模式） |
-| `/etc/systemd/system/cgg-hysteria2.service` | Hysteria 2 服务（Hysteria 2 模式） |
-| `/etc/modules-load.d/cgg-vless-bbr.conf` | BBR 内核模块开机加载（总菜单第 15 项） |
-| `/etc/sysctl.d/99-cgg-vless-bbr.conf` | BBR 拥塞控制参数（总菜单第 15 项） |
-| `/etc/sysctl.d/99-cgg-vless-tcp.conf` | TCP 窗口调优参数（总菜单第 14 项） |
-| `/opt/cgg-vless/` | 总菜单下载的子脚本缓存 |
-| `/root/.acme.sh/` | acme.sh 及自动续期任务 |
 
 
 ## Cloudflare CDN 配置建议
