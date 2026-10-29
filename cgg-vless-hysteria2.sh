@@ -31,7 +31,6 @@ CERT_FILE=""
 KEY_FILE=""
 SERVER_IP=""
 HOP_PORTS=""
-CERT_SELFSIGNED=""
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -188,7 +187,7 @@ validate_domain() {
 ask_domain() {
     local input
     while true; do
-        read -r -p "证书域名 / SNI（如 hy2.example.com；使用自签证书时可填任意合法域名，如 www.bing.com）：" input
+        read -r -p "证书域名 / SNI（如 hy2.example.com）：" input
         input="${input//[[:space:]]/}"
         if [[ -z "$input" ]]; then
             warn "域名不能为空"
@@ -300,75 +299,31 @@ setup_cert_manual() {
     log "证书已复制到：${CERT_DIR}"
 }
 
-# 自动生成自签证书：以 DOMAIN 作为 CN/SAN，有效期 10 年
-# 自签证书不受客户端信任，分享链接必须带 insecure=1
-setup_cert_selfsigned() {
-    command -v openssl >/dev/null 2>&1 || die "缺少 openssl，无法生成自签证书"
-
-    install -d -m 755 -o root -g root "$CERT_DIR"
-
-    local cert="${CERT_DIR}/fullchain.pem"
-    local key="${CERT_DIR}/privkey.pem"
-
-    log "正在生成自签证书（CN=${DOMAIN}，有效期 3650 天）..."
-    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$key" -out "$cert" \
-        -days 3650 -nodes \
-        -subj "/CN=${DOMAIN}" \
-        -addext "subjectAltName=DNS:${DOMAIN}" >/dev/null 2>&1; then
-        rm -f "$cert" "$key"
-        die "自签证书生成失败（需 openssl 1.1.1+ 支持 -addext）"
-    fi
-
-    # 有效性校验：可解析且未过期
-    if ! openssl x509 -in "$cert" -noout 2>/dev/null; then
-        rm -f "$cert" "$key"
-        die "自签证书校验失败：证书无法解析"
-    fi
-    if ! openssl x509 -in "$cert" -checkend 0 -noout 2>/dev/null; then
-        rm -f "$cert" "$key"
-        die "自签证书校验失败：证书已过期"
-    fi
-
-    chmod 644 "$cert"
-    fix_key_permission "$key"
-
-    CERT_FILE="$cert"
-    KEY_FILE="$key"
-    CERT_SELFSIGNED=1
-    log "自签证书已生成：${cert}"
-}
-
 ask_cert_source() {
     local ans
     if [[ -s "${XRAY_CERT_DIR}/fullchain.pem" && -s "${XRAY_CERT_DIR}/privkey.pem" ]]; then
         log "检测到 Xray 证书目录已有证书"
-        printf '  1) 直接复用 /usr/local/etc/xray/cert 下的证书\n'
-        printf '  2) 手动输入证书文件路径（.cer / .key）\n'
-        printf '  3) 自动生成自签证书（客户端需跳过证书验证）\n'
-        read -r -p "请选择 [1-3]（回车默认 1）：" ans
+        read -r -p "直接复用 /usr/local/etc/xray/cert 下的证书？[Y/n]：" ans
         case "$ans" in
-            ""|1)
+            [Nn]*)
+                setup_cert_manual
+                ;;
+            *)
                 CERT_FILE="${XRAY_CERT_DIR}/fullchain.pem"
                 KEY_FILE="${XRAY_CERT_DIR}/privkey.pem"
                 fix_key_permission "$KEY_FILE"
                 log "使用已有证书：${CERT_FILE}"
                 ;;
-            2) setup_cert_manual ;;
-            3) setup_cert_selfsigned ;;
-            *) die "无效选择：${ans}" ;;
         esac
         return 0
     fi
 
     warn "未检测到 ${XRAY_CERT_DIR} 下的证书"
     printf '  1) 手动输入证书文件路径（.cer / .key）\n'
-    printf '  2) 自动生成自签证书（客户端需跳过证书验证）\n'
-    printf '  3) 取消，先去总菜单第 11 项申请证书\n'
-    read -r -p "请选择 [1-3]：" ans
+    printf '  2) 取消，先去总菜单第 11 项申请证书\n'
+    read -r -p "请选择 [1-2]：" ans
     case "$ans" in
         1) setup_cert_manual ;;
-        2) setup_cert_selfsigned ;;
         *) die "已取消：请先在总菜单第 11 项申请证书，或准备好证书文件后重跑" ;;
     esac
 }
@@ -603,7 +558,6 @@ save_info() {
         printf 'PASSWORD=%s\n' "$PASSWORD"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
         printf 'HOP_PORTS=%s\n' "$HOP_PORTS"
-        printf 'CERT_SELFSIGNED=%s\n' "$CERT_SELFSIGNED"
     } > "$INFO_FILE"
     chmod 600 "$INFO_FILE"
 }
@@ -612,12 +566,9 @@ save_info() {
 print_result() {
     local ip link extra=""
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    # 端口跳跃按 Hysteria 2 URI 规范写入 mport；自签证书需 insecure=1 跳过客户端校验
+    # 端口跳跃按 Hysteria 2 URI 规范写入 mport，客户端据此随机选口、自动切换
     if [[ -n "$HOP_PORTS" ]]; then
-        extra="${extra}&mport=${PORT},${HOP_PORTS// /,}"
-    fi
-    if [[ "$CERT_SELFSIGNED" == "1" ]]; then
-        extra="${extra}&insecure=1"
+        extra="&mport=${PORT},${HOP_PORTS// /,}"
     fi
     link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3${extra}#${NODE_NAME}"
 
@@ -633,9 +584,6 @@ print_result() {
     printf '  域名 / SNI  : %s\n' "$DOMAIN"
     printf '  密码        : %s\n' "$PASSWORD"
     printf '  ALPN        : h3\n'
-    if [[ "$CERT_SELFSIGNED" == "1" ]]; then
-        printf '  证书        : 自签证书（客户端需开启跳过证书验证）\n'
-    fi
     printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
     printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
@@ -657,9 +605,6 @@ print_result() {
     printf '  - 证书域名需与 SNI 一致，否则客户端会校验证书失败\n'
     if [[ -n "$HOP_PORTS" ]]; then
         printf '  - 端口跳跃：云服务商安全组需放行跳跃端口的 UDP 流量（%s），客户端将随机选口连接\n' "${HOP_PORTS// /, }"
-    fi
-    if [[ "$CERT_SELFSIGNED" == "1" ]]; then
-        printf '  - 使用自签证书：客户端必须开启 allowInsecure / 跳过证书验证，否则无法连接\n'
     fi
 }
 
