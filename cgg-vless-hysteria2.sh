@@ -30,6 +30,8 @@ NODE_NAME=""
 CERT_FILE=""
 KEY_FILE=""
 SERVER_IP=""
+HOP_PORTS=""
+CERT_SELFSIGNED=""
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -204,18 +206,39 @@ ask_domain() {
 
 ask_port() {
     local input
-    read -r -p "UDP 监听端口（1-65535，回车默认 443）：" input
-    input="${input//[[:space:]]/}"
-    if [[ -z "$input" ]]; then
-        PORT="443"
-    elif [[ "$input" =~ ^[0-9]+$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
-        PORT="$input"
-    else
-        die "端口不合法：${input}"
-    fi
+    read -r -p "UDP 监听端口（1-65535，可空格分隔多个端口实现端口跳跃，回车默认 443）：" input
 
-    if port_in_use_udp "$PORT"; then
-        die "UDP 端口 ${PORT} 已被占用，请为 Hysteria 2 选择其他端口"
+    # 按空白切分；纯空格输入等价于空输入（herestring 自带换行，read 必然返回 0）
+    local -a ports=()
+    read -r -a ports <<< "$input"
+
+    if (( ${#ports[@]} == 0 )); then
+        PORT="443"
+        HOP_PORTS=""
+    else
+        if (( ${#ports[@]} > 20 )); then
+            die "端口数量过多（${#ports[@]} 个，最多支持 20 个）"
+        fi
+        local p seen=""
+        local -a norm=()
+        for p in "${ports[@]}"; do
+            if [[ ! "$p" =~ ^[0-9]+$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then
+                die "端口不合法：${p}"
+            fi
+            # 去掉前导零（如 0443 -> 443），避免写入 JSON / iptables 时格式非法
+            p=$((10#$p))
+            case " $seen " in
+                *" $p "*) die "端口重复：${p}" ;;
+            esac
+            seen="${seen} ${p}"
+            if port_in_use_udp "$p"; then
+                die "UDP 端口 ${p} 已被占用，请为 Hysteria 2 选择其他端口"
+            fi
+            norm+=("$p")
+        done
+        # 第一个端口为主监听端口（写入 listen_port），其余为跳跃端口
+        PORT="${norm[0]}"
+        HOP_PORTS="${norm[*]:1}"
     fi
 
     # AnyTLS 为 TCP，同号端口本质可共存，仅提示避免误判
@@ -227,7 +250,11 @@ ask_port() {
         fi
     fi
 
-    log "UDP 监听端口：${PORT}"
+    if [[ -n "$HOP_PORTS" ]]; then
+        log "UDP 监听端口：${PORT}（端口跳跃：${HOP_PORTS// /, }）"
+    else
+        log "UDP 监听端口：${PORT}"
+    fi
 }
 
 ask_node_name() {
@@ -273,31 +300,75 @@ setup_cert_manual() {
     log "证书已复制到：${CERT_DIR}"
 }
 
+# 自动生成自签证书：以 DOMAIN 作为 CN/SAN，有效期 10 年
+# 自签证书不受客户端信任，分享链接必须带 insecure=1
+setup_cert_selfsigned() {
+    command -v openssl >/dev/null 2>&1 || die "缺少 openssl，无法生成自签证书"
+
+    install -d -m 755 -o root -g root "$CERT_DIR"
+
+    local cert="${CERT_DIR}/fullchain.pem"
+    local key="${CERT_DIR}/privkey.pem"
+
+    log "正在生成自签证书（CN=${DOMAIN}，有效期 3650 天）..."
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$key" -out "$cert" \
+        -days 3650 -nodes \
+        -subj "/CN=${DOMAIN}" \
+        -addext "subjectAltName=DNS:${DOMAIN}" >/dev/null 2>&1; then
+        rm -f "$cert" "$key"
+        die "自签证书生成失败（需 openssl 1.1.1+ 支持 -addext）"
+    fi
+
+    # 有效性校验：可解析且未过期
+    if ! openssl x509 -in "$cert" -noout 2>/dev/null; then
+        rm -f "$cert" "$key"
+        die "自签证书校验失败：证书无法解析"
+    fi
+    if ! openssl x509 -in "$cert" -checkend 0 -noout 2>/dev/null; then
+        rm -f "$cert" "$key"
+        die "自签证书校验失败：证书已过期"
+    fi
+
+    chmod 644 "$cert"
+    fix_key_permission "$key"
+
+    CERT_FILE="$cert"
+    KEY_FILE="$key"
+    CERT_SELFSIGNED=1
+    log "自签证书已生成：${cert}"
+}
+
 ask_cert_source() {
     local ans
     if [[ -s "${XRAY_CERT_DIR}/fullchain.pem" && -s "${XRAY_CERT_DIR}/privkey.pem" ]]; then
         log "检测到 Xray 证书目录已有证书"
-        read -r -p "直接复用 /usr/local/etc/xray/cert 下的证书？[Y/n]：" ans
+        printf '  1) 直接复用 /usr/local/etc/xray/cert 下的证书\n'
+        printf '  2) 手动输入证书文件路径（.cer / .key）\n'
+        printf '  3) 自动生成自签证书（客户端需跳过证书验证）\n'
+        read -r -p "请选择 [1-3]（回车默认 1）：" ans
         case "$ans" in
-            [Nn]*)
-                setup_cert_manual
-                ;;
-            *)
+            ""|1)
                 CERT_FILE="${XRAY_CERT_DIR}/fullchain.pem"
                 KEY_FILE="${XRAY_CERT_DIR}/privkey.pem"
                 fix_key_permission "$KEY_FILE"
                 log "使用已有证书：${CERT_FILE}"
                 ;;
+            2) setup_cert_manual ;;
+            3) setup_cert_selfsigned ;;
+            *) die "无效选择：${ans}" ;;
         esac
         return 0
     fi
 
     warn "未检测到 ${XRAY_CERT_DIR} 下的证书"
     printf '  1) 手动输入证书文件路径（.cer / .key）\n'
-    printf '  2) 取消，先去总菜单第 11 项申请证书\n'
-    read -r -p "请选择 [1-2]：" ans
+    printf '  2) 自动生成自签证书（客户端需跳过证书验证）\n'
+    printf '  3) 取消，先去总菜单第 11 项申请证书\n'
+    read -r -p "请选择 [1-3]：" ans
     case "$ans" in
         1) setup_cert_manual ;;
+        2) setup_cert_selfsigned ;;
         *) die "已取消：请先在总菜单第 11 项申请证书，或准备好证书文件后重跑" ;;
     esac
 }
@@ -371,6 +442,45 @@ EOF
     log "配置写入并校验通过：${CONFIG_FILE}"
 }
 
+# ------------------------------ 端口跳跃 --------------------------------------
+# sing-box 服务端不支持原生多端口监听，采用业界标准做法：
+# 主端口正常监听，跳跃端口通过 iptables REDIRECT 转发到主端口，
+# 客户端依据分享链接中的 mport 参数随机选口、自动切换
+setup_port_hopping() {
+    [[ -n "$HOP_PORTS" ]] || return 0
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        warn "未检测到 iptables，端口跳跃规则无法配置，请手动将端口 ${HOP_PORTS// /, } 转发到 ${PORT}/udp"
+        return 0
+    fi
+
+    local p
+    for p in $HOP_PORTS; do
+        if ! iptables -t nat -C PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$PORT" 2>/dev/null; then
+            iptables -t nat -A PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$PORT" \
+                || warn "端口跳跃规则添加失败：${p} -> ${PORT}"
+        fi
+    done
+    log "端口跳跃规则已配置：${HOP_PORTS// /, } -> ${PORT}"
+
+    # 持久化：优先 netfilter-persistent，其次 /etc/iptables/rules.v4；都不可用则警告
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        if netfilter-persistent save >/dev/null 2>&1; then
+            log "iptables 规则已持久化（netfilter-persistent）"
+        else
+            warn "netfilter-persistent 保存失败，重启后端口跳跃规则将丢失"
+        fi
+    elif [[ -f /etc/iptables/rules.v4 ]] && command -v iptables-save >/dev/null 2>&1; then
+        if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+            log "iptables 规则已持久化（/etc/iptables/rules.v4）"
+        else
+            warn "iptables-save 写入 /etc/iptables/rules.v4 失败，重启后端口跳跃规则将丢失"
+        fi
+    else
+        warn "未安装 iptables-persistent，重启后端口跳跃规则将丢失；可执行 apt-get install -y iptables-persistent 后重跑"
+    fi
+}
+
 # ------------------------------ systemd 服务 ----------------------------------
 write_service() {
     if [[ -f "$SERVICE_FILE" ]] && ! grep -q "cgg-hysteria2" "$SERVICE_FILE"; then
@@ -437,6 +547,20 @@ verify_runtime() {
         warn "未检测到 UDP 端口 ${PORT} 监听，请执行 journalctl -u ${SERVICE_NAME} -n 50 排查"
     fi
 
+    # 跳跃端口不直接监听（经 REDIRECT 转发），仅校验 iptables 规则是否生效
+    if [[ -n "$HOP_PORTS" ]] && command -v iptables >/dev/null 2>&1; then
+        local p missing=0
+        for p in $HOP_PORTS; do
+            if ! iptables -t nat -C PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$PORT" 2>/dev/null; then
+                warn "端口跳跃规则未生效：${p} -> ${PORT}"
+                missing=1
+            fi
+        done
+        if (( missing == 0 )); then
+            log "端口跳跃规则已全部生效：${HOP_PORTS// /, }"
+        fi
+    fi
+
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         log "服务状态：运行中（异常退出将自动重连）"
     else
@@ -446,19 +570,26 @@ verify_runtime() {
 
 # ------------------------------ 防火墙 ----------------------------------------
 configure_firewall() {
+    local all_ports="$PORT${HOP_PORTS:+ ${HOP_PORTS}}"
+    local p
+
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${PORT}/udp" >/dev/null 2>&1 || warn "UFW 放行 ${PORT}/udp 失败"
-        log "UFW 已放行端口 ${PORT}/udp"
+        for p in $all_ports; do
+            ufw allow "${p}/udp" >/dev/null 2>&1 || warn "UFW 放行 ${p}/udp 失败"
+        done
+        log "UFW 已放行端口 ${all_ports// /, }/udp"
     fi
 
     if command -v iptables >/dev/null 2>&1; then
-        if ! iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
-            iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT \
-                || warn "iptables 放行端口失败，请手动放行 ${PORT}/udp"
-        fi
-        log "iptables 已放行端口 ${PORT}/udp（如使用 firewalld 请另行放行）"
+        for p in $all_ports; do
+            if ! iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT -p udp --dport "$p" -j ACCEPT \
+                    || warn "iptables 放行端口失败，请手动放行 ${p}/udp"
+            fi
+        done
+        log "iptables 已放行端口 ${all_ports// /, }/udp（如使用 firewalld 请另行放行）"
     elif ! command -v ufw >/dev/null 2>&1; then
-        warn "未检测到 UFW / iptables，请手动放行 ${PORT}/udp"
+        warn "未检测到 UFW / iptables，请手动放行 ${all_ports// /, }/udp"
     fi
 }
 
@@ -471,24 +602,40 @@ save_info() {
         printf 'DOMAIN=%s\n' "$DOMAIN"
         printf 'PASSWORD=%s\n' "$PASSWORD"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
+        printf 'HOP_PORTS=%s\n' "$HOP_PORTS"
+        printf 'CERT_SELFSIGNED=%s\n' "$CERT_SELFSIGNED"
     } > "$INFO_FILE"
     chmod 600 "$INFO_FILE"
 }
 
 # ------------------------------ 输出结果 --------------------------------------
 print_result() {
-    local ip link
+    local ip link extra=""
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3#${NODE_NAME}"
+    # 端口跳跃按 Hysteria 2 URI 规范写入 mport；自签证书需 insecure=1 跳过客户端校验
+    if [[ -n "$HOP_PORTS" ]]; then
+        extra="${extra}&mport=${PORT},${HOP_PORTS// /,}"
+    fi
+    if [[ "$CERT_SELFSIGNED" == "1" ]]; then
+        extra="${extra}&insecure=1"
+    fi
+    link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3${extra}#${NODE_NAME}"
 
     printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : Hysteria 2（sing-box，QUIC/UDP）\n'
     printf '  节点名称    : %s\n' "$NODE_NAME"
     printf '  地址 (IP)   : %s\n' "$ip"
-    printf '  UDP 端口    : %s\n' "$PORT"
+    if [[ -n "$HOP_PORTS" ]]; then
+        printf '  UDP 端口    : %s（跳跃端口：%s）\n' "$PORT" "${HOP_PORTS// /, }"
+    else
+        printf '  UDP 端口    : %s\n' "$PORT"
+    fi
     printf '  域名 / SNI  : %s\n' "$DOMAIN"
     printf '  密码        : %s\n' "$PASSWORD"
     printf '  ALPN        : h3\n'
+    if [[ "$CERT_SELFSIGNED" == "1" ]]; then
+        printf '  证书        : 自签证书（客户端需开启跳过证书验证）\n'
+    fi
     printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
     printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
@@ -508,6 +655,12 @@ print_result() {
     printf '  - 无法套 Cloudflare CDN，必须客户端直连\n'
     printf '  - NAT 机器需在服务商面板把 UDP 外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
     printf '  - 证书域名需与 SNI 一致，否则客户端会校验证书失败\n'
+    if [[ -n "$HOP_PORTS" ]]; then
+        printf '  - 端口跳跃：云服务商安全组需放行跳跃端口的 UDP 流量（%s），客户端将随机选口连接\n' "${HOP_PORTS// /, }"
+    fi
+    if [[ "$CERT_SELFSIGNED" == "1" ]]; then
+        printf '  - 使用自签证书：客户端必须开启 allowInsecure / 跳过证书验证，否则无法连接\n'
+    fi
 }
 
 # ------------------------------ 主流程 ----------------------------------------
@@ -529,6 +682,7 @@ main() {
     install_singbox
     write_config
     write_service
+    setup_port_hopping
     verify_runtime
     configure_firewall
     save_info
