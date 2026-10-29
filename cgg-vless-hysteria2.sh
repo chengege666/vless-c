@@ -188,7 +188,7 @@ validate_domain() {
 ask_domain() {
     local input
     while true; do
-        read -r -p "证书域名 / SNI（如 hy2.example.com）：" input
+        read -r -p "证书域名 / SNI（如 hy2.example.com；使用自签证书时可填任意合法域名，如 www.bing.com）：" input
         input="${input//[[:space:]]/}"
         if [[ -z "$input" ]]; then
             warn "域名不能为空"
@@ -206,7 +206,7 @@ ask_domain() {
 
 ask_port() {
     local input
-    read -r -p "UDP 监听端口（1-65535，可空格分隔多个端口实现端口跳跃，回车默认 443）：" input
+    read -r -p "UDP 监听端口（1-65535，回车默认 443；可空格分隔多个端口实现端口跳跃，第一个为主监听端口，其余为跳跃端口）：" input
 
     # 按空白切分；纯空格输入等价于空输入（herestring 自带换行，read 必然返回 0）
     local -a ports=()
