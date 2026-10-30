@@ -21,6 +21,8 @@ readonly XRAY_CERT_DIR="/usr/local/etc/xray/cert"
 readonly RUN_USER="nobody"
 readonly RUN_GROUP="nogroup"
 readonly DEFAULT_NODE_NAME="cgg-hysteria2"
+# GitHub 加速镜像（前缀式代理）；置空则完全直连 GitHub
+readonly GH_MIRROR="https://cgjs.1231818.xyz/"
 
 # ------------------------------ 运行期变量 ------------------------------------
 PORT=""
@@ -92,6 +94,25 @@ require_tty() {
 }
 
 # ------------------------------ 公网 IP ---------------------------------------
+# 判断是否为可用于分享链接的公网 IPv4（排除私网 / 保留 / 组播地址）
+is_public_ipv4() {
+    local ip="$1" a b c d
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    a=$((10#${BASH_REMATCH[1]}))
+    b=$((10#${BASH_REMATCH[2]}))
+    c=$((10#${BASH_REMATCH[3]}))
+    d=$((10#${BASH_REMATCH[4]}))
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    if (( a == 0 || a == 10 || a == 127 || a >= 224 )) \
+        || (( a == 169 && b == 254 )) \
+        || (( a == 172 && b >= 16 && b <= 31 )) \
+        || (( a == 192 && b == 168 )) \
+        || (( a == 100 && b >= 64 && b <= 127 )); then
+        return 1
+    fi
+    return 0
+}
+
 get_public_ip() {
     local ip=""
     ip="$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
@@ -100,6 +121,11 @@ get_public_ip() {
     fi
     if [[ -z "$ip" ]]; then
         ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    # hostname -I 兜底在 NAT 机器上可能拿到内网地址，不可用于分享链接
+    if [[ -n "$ip" ]] && ! is_public_ipv4 "$ip"; then
+        warn "获取到的地址 ${ip} 不是公网 IPv4（NAT/内网环境），分享链接将显示占位符，请手动替换为实际公网 IP"
+        ip=""
     fi
     printf '%s' "$ip"
 }
@@ -115,6 +141,17 @@ detect_arch() {
     esac
 }
 
+# ------------------------------ 下载加速 --------------------------------------
+# 将原始 GitHub 地址转换为镜像地址；GH_MIRROR 为空时原样返回
+mirror_url() {
+    local url="$1"
+    if [[ -n "$GH_MIRROR" ]]; then
+        printf '%s%s' "${GH_MIRROR%/}/" "$url"
+    else
+        printf '%s' "$url"
+    fi
+}
+
 # ------------------------------ 端口检查 --------------------------------------
 # Hysteria 2 基于 QUIC/UDP，端口冲突检测必须针对 UDP
 port_in_use_udp() {
@@ -126,21 +163,39 @@ port_in_use_udp() {
 # ------------------------------ 安装 sing-box ---------------------------------
 install_singbox() {
     if [[ -x "$SINGBOX_BIN" ]]; then
-        log "检测到已安装 sing-box：$("$SINGBOX_BIN" version 2>/dev/null | head -n 1)"
+        local cur_line cur_major=0 cur_minor=0
+        cur_line="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 || true)"
+        log "检测到已安装 sing-box：${cur_line}"
+        # hysteria2 入站自 1.8 起提供，版本过低时提前中止，避免写出无法加载的配置
+        if [[ "$cur_line" =~ ([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
+            cur_major=$((10#${BASH_REMATCH[1]}))
+            cur_minor=$((10#${BASH_REMATCH[2]}))
+            if (( cur_major < 1 || (cur_major == 1 && cur_minor < 8) )); then
+                die "已安装的 sing-box 版本过低，hysteria2 入站需要 1.8+；请升级，或删除 ${SINGBOX_BIN} 后重跑（脚本会自动下载最新版）"
+            fi
+        fi
         return 0
     fi
 
     command -v curl >/dev/null 2>&1 || die "缺少 curl，请先安装：apt-get install -y curl"
     command -v tar >/dev/null 2>&1 || die "缺少 tar，请先安装：apt-get install -y tar"
 
-    local arch tag ver url tmpdir extracted
+    local arch tag ver url tmpdir extracted api_json=""
     if ! arch="$(detect_arch)"; then
         die "当前架构不支持自动安装（仅支持 x86_64 / aarch64），请手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
     fi
 
     log "获取 sing-box 最新版本..."
-    tag="$(curl -fsSL --retry 3 --connect-timeout 15 \
-        "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+    if [[ -n "$GH_MIRROR" ]]; then
+        log "使用加速镜像：${GH_MIRROR}"
+        api_json="$(curl -fsSL --max-time 30 --retry 2 --retry-delay 2 --connect-timeout 15 \
+            "$(mirror_url "https://api.github.com/repos/SagerNet/sing-box/releases/latest")" 2>/dev/null || true)"
+    fi
+    if [[ -z "$api_json" ]]; then
+        api_json="$(curl -fsSL --max-time 30 --retry 2 --retry-delay 2 --connect-timeout 15 \
+            "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null || true)"
+    fi
+    tag="$(printf '%s' "$api_json" \
         | grep -m1 '"tag_name"' \
         | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
     if [[ -z "$tag" ]]; then
@@ -151,10 +206,22 @@ install_singbox() {
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${ver}-linux-${arch}.tar.gz"
     tmpdir="$(mktemp -d)"
 
-    log "下载 sing-box：${url}"
-    if ! curl -fsSL --retry 3 --connect-timeout 15 -o "${tmpdir}/pkg.tar.gz" "$url"; then
-        rm -rf "$tmpdir"
-        die "sing-box 下载失败，可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+    if [[ -n "$GH_MIRROR" ]]; then
+        log "下载 sing-box（加速镜像）：$(mirror_url "$url")"
+        if ! curl -fL --max-time 300 --retry 2 --retry-delay 2 --connect-timeout 15 \
+            --progress-bar -o "${tmpdir}/pkg.tar.gz" "$(mirror_url "$url")"; then
+            warn "加速镜像下载失败，回退直连 GitHub"
+            rm -f "${tmpdir}/pkg.tar.gz"
+        fi
+    fi
+
+    if [[ ! -s "${tmpdir}/pkg.tar.gz" ]]; then
+        log "下载 sing-box：${url}"
+        if ! curl -fsSL --max-time 300 --retry 2 --retry-delay 2 --connect-timeout 15 \
+            -o "${tmpdir}/pkg.tar.gz" "$url"; then
+            rm -rf "$tmpdir"
+            die "sing-box 下载失败，可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        fi
     fi
 
     if ! tar -xzf "${tmpdir}/pkg.tar.gz" -C "$tmpdir"; then
@@ -205,6 +272,7 @@ ask_domain() {
 
 ask_port() {
     local input
+    command -v ss >/dev/null 2>&1 || warn "未检测到 ss（iproute2），将跳过 UDP 端口占用检测，请自行确认端口未被占用"
     read -r -p "UDP 监听端口（1-65535，回车默认 443；可空格分隔多个端口实现端口跳跃，第一个为主监听端口，其余为跳跃端口）：" input
 
     # 按空白切分；纯空格输入等价于空输入（herestring 自带换行，read 必然返回 0）
@@ -231,7 +299,15 @@ ask_port() {
             esac
             seen="${seen} ${p}"
             if port_in_use_udp "$p"; then
-                die "UDP 端口 ${p} 已被占用，请为 Hysteria 2 选择其他端口"
+                # 占用者可能是本服务自身：先停止本服务释放端口，便于重装/变更配置
+                if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+                    warn "检测到 ${SERVICE_NAME} 正在运行且占用 UDP 端口，先停止服务后继续"
+                    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+                    sleep 1
+                fi
+                if port_in_use_udp "$p"; then
+                    die "UDP 端口 ${p} 已被占用，请为 Hysteria 2 选择其他端口"
+                fi
             fi
             norm+=("$p")
         done
@@ -309,10 +385,15 @@ ask_cert_source() {
                 setup_cert_manual
                 ;;
             *)
-                CERT_FILE="${XRAY_CERT_DIR}/fullchain.pem"
-                KEY_FILE="${XRAY_CERT_DIR}/privkey.pem"
-                fix_key_permission "$KEY_FILE"
-                log "使用已有证书：${CERT_FILE}"
+                # 复制一份使用，避免改动 Xray 原有证书文件的属组/权限影响现有节点
+                install -d -m 755 -o root -g root "$CERT_DIR"
+                cp -f "${XRAY_CERT_DIR}/fullchain.pem" "${CERT_DIR}/fullchain.pem" || die "复制 Xray 证书失败"
+                cp -f "${XRAY_CERT_DIR}/privkey.pem" "${CERT_DIR}/privkey.pem" || die "复制 Xray 私钥失败"
+                chmod 644 "${CERT_DIR}/fullchain.pem"
+                fix_key_permission "${CERT_DIR}/privkey.pem"
+                CERT_FILE="${CERT_DIR}/fullchain.pem"
+                KEY_FILE="${CERT_DIR}/privkey.pem"
+                log "已复制 Xray 证书到 ${CERT_DIR}（原证书文件未改动）"
                 ;;
         esac
         return 0
@@ -402,6 +483,32 @@ EOF
 # 主端口正常监听，跳跃端口通过 iptables REDIRECT 转发到主端口，
 # 客户端依据分享链接中的 mport 参数随机选口、自动切换
 setup_port_hopping() {
+    local p
+
+    # 清理上次安装遗留的旧端口规则（依据 info 文件记录），避免更换端口后规则残留
+    if command -v iptables >/dev/null 2>&1 && [[ -f "$INFO_FILE" ]]; then
+        local old_port="" old_hops="" cur_ports=" $PORT $HOP_PORTS "
+        old_port="$(sed -n 's/^PORT=//p' "$INFO_FILE" 2>/dev/null | head -n 1 || true)"
+        old_hops="$(sed -n 's/^HOP_PORTS=//p' "$INFO_FILE" 2>/dev/null | head -n 1 || true)"
+        if [[ "$old_port" =~ ^[0-9]+$ ]]; then
+            for p in $old_hops; do
+                while iptables -t nat -C PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$old_port" 2>/dev/null; do
+                    iptables -t nat -D PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$old_port" 2>/dev/null || break
+                done
+            done
+            # 旧端口的 INPUT 放行规则一并清理；当前端口会在 configure_firewall 中重新放行
+            for p in $old_port $old_hops; do
+                case "$cur_ports" in
+                    *" $p "*) continue ;;
+                esac
+                while iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; do
+                    iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || break
+                done
+            done
+            log "已清理上次安装的旧端口规则（旧端口：${old_port}${old_hops:+ ${old_hops}}）"
+        fi
+    fi
+
     [[ -n "$HOP_PORTS" ]] || return 0
 
     if ! command -v iptables >/dev/null 2>&1; then
@@ -409,7 +516,6 @@ setup_port_hopping() {
         return 0
     fi
 
-    local p
     for p in $HOP_PORTS; do
         if ! iptables -t nat -C PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$PORT" 2>/dev/null; then
             iptables -t nat -A PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$PORT" \
@@ -418,6 +524,11 @@ setup_port_hopping() {
     done
     log "端口跳跃规则已配置：${HOP_PORTS// /, } -> ${PORT}"
 
+    persist_iptables
+}
+
+# 持久化 iptables 规则；两处调用，最后一次位于防火墙规则全部写入之后
+persist_iptables() {
     # 持久化：优先 netfilter-persistent，其次 /etc/iptables/rules.v4；都不可用则警告
     if command -v netfilter-persistent >/dev/null 2>&1; then
         if netfilter-persistent save >/dev/null 2>&1; then
@@ -455,6 +566,7 @@ Wants=network-online.target
 [Service]
 User=${RUN_USER}
 Group=${RUN_GROUP}
+WorkingDirectory=${SINGBOX_DIR}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -543,6 +655,8 @@ configure_firewall() {
             fi
         done
         log "iptables 已放行端口 ${all_ports// /, }/udp（如使用 firewalld 请另行放行）"
+        # 规则已全部写入，此处统一持久化，确保重启后 nat 跳跃与 INPUT 放行同时生效
+        persist_iptables
     elif ! command -v ufw >/dev/null 2>&1; then
         warn "未检测到 UFW / iptables，请手动放行 ${all_ports// /, }/udp"
     fi
@@ -603,6 +717,7 @@ print_result() {
     printf '  - 无法套 Cloudflare CDN，必须客户端直连\n'
     printf '  - NAT 机器需在服务商面板把 UDP 外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
     printf '  - 证书域名需与 SNI 一致，否则客户端会校验证书失败\n'
+    printf '  - 链接中地址为 IP：若客户端要求填写域名，可把 %s 换成 %s（该域名需已解析到本机）\n' "$ip" "$DOMAIN"
     if [[ -n "$HOP_PORTS" ]]; then
         printf '  - 端口跳跃：云服务商安全组需放行跳跃端口的 UDP 流量（%s），客户端将随机选口连接\n' "${HOP_PORTS// /, }"
     fi
