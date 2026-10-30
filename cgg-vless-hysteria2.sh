@@ -17,6 +17,8 @@ readonly CERT_DIR="${SINGBOX_DIR}/cert-hysteria2"
 readonly ANYTLS_CONFIG="${SINGBOX_DIR}/config.json"
 readonly SERVICE_NAME="cgg-hysteria2"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly HOP_SCRIPT="${SINGBOX_DIR}/port-hopping.sh"
+readonly HOP_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}-hop.service"
 readonly XRAY_CERT_DIR="/usr/local/etc/xray/cert"
 readonly RUN_USER="nobody"
 readonly RUN_GROUP="nogroup"
@@ -31,6 +33,8 @@ NODE_NAME=""
 CERT_FILE=""
 KEY_FILE=""
 SERVER_IP=""
+HOP_PORTS=()   # 端口跳跃项（单个端口或 起始-结束）
+HOP_SPEC=""    # 链接 mport 参数，逗号分隔
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -202,16 +206,67 @@ ask_domain() {
     log "证书域名 / SNI：${DOMAIN}"
 }
 
+# 校验单个端口或端口范围，成功时输出归一化值
+normalize_port_token() {
+    local t="$1"
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        (( 10#$t >= 1 && 10#$t <= 65535 )) || return 1
+        printf '%d\n' "$((10#$t))"
+        return 0
+    fi
+    if [[ "$t" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        local s="$((10#${BASH_REMATCH[1]}))"
+        local e="$((10#${BASH_REMATCH[2]}))"
+        (( s >= 1 && s <= 65535 && e >= 1 && e <= 65535 )) || return 1
+        (( s < e )) || return 1
+        printf '%d-%d\n' "$s" "$e"
+        return 0
+    fi
+    return 1
+}
+
 ask_port() {
-    local input
-    read -r -p "UDP 监听端口（1-65535，回车默认 443）：" input
-    input="${input//[[:space:]]/}"
-    if [[ -z "$input" ]]; then
+    local input token norm item s e
+    local -a tokens=() norm_tokens=()
+
+    HOP_PORTS=()
+    HOP_SPEC=""
+
+    read -r -p "UDP 监听端口（回车默认 443；端口跳跃输入多个，空格分隔，第一个为主端口）：" input
+    input="${input//$'\t'/ }"
+    read -r -a tokens <<< "$input"
+
+    for token in "${tokens[@]}"; do
+        [[ -n "$token" ]] || continue
+        norm="$(normalize_port_token "$token")" || die "端口不合法：${token}（支持单个端口或 起始-结束 范围）"
+        norm_tokens+=("$norm")
+    done
+
+    if (( ${#norm_tokens[@]} == 0 )); then
         PORT="443"
-    elif [[ "$input" =~ ^[0-9]+$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
-        PORT="$input"
     else
-        die "端口不合法：${input}"
+        PORT="${norm_tokens[0]}"
+        if [[ "$PORT" == *-* ]]; then
+            die "第一个端口必须是主监听端口（单个端口），不能是范围：${PORT}"
+        fi
+    fi
+
+    for item in "${norm_tokens[@]:1}"; do
+        if [[ "$item" == *-* ]]; then
+            s="${item%%-*}"
+            e="${item##*-}"
+            if (( 10#$PORT >= 10#$s && 10#$PORT <= 10#$e )); then
+                die "端口跳跃范围 ${item} 包含主端口 ${PORT}，请去掉主端口"
+            fi
+        elif [[ "$item" == "$PORT" ]]; then
+            die "端口跳跃端口不能与主端口相同：${item}"
+        fi
+        HOP_PORTS+=("$item")
+    done
+
+    if (( ${#HOP_PORTS[@]} > 0 )); then
+        HOP_SPEC="$(printf '%s,' "${HOP_PORTS[@]}")"
+        HOP_SPEC="${HOP_SPEC%,}"
     fi
 
     if port_in_use_udp "$PORT"; then
@@ -228,6 +283,9 @@ ask_port() {
     fi
 
     log "UDP 监听端口：${PORT}"
+    if [[ -n "$HOP_SPEC" ]]; then
+        log "端口跳跃：${HOP_SPEC} -> ${PORT}/udp"
+    fi
 }
 
 ask_node_name() {
@@ -516,6 +574,112 @@ configure_firewall() {
     fi
 }
 
+# ------------------------------ 端口跳跃 --------------------------------------
+# 主端口不变，用 nat REDIRECT 把跳跃端口（UDP）转发到主端口
+install_port_hopping() {
+    # 未配置跳跃端口：清理可能残留的旧规则
+    if (( ${#HOP_PORTS[@]} == 0 )); then
+        if [[ -f "$HOP_SERVICE_FILE" ]]; then
+            systemctl disable --now "${SERVICE_NAME}-hop" >/dev/null 2>&1 || true
+            rm -f "$HOP_SERVICE_FILE" "$HOP_SCRIPT"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            log "已清理旧的端口跳跃配置"
+        fi
+        return 0
+    fi
+
+    install -d -m 755 -o root -g root "$SINGBOX_DIR"
+
+    cat > "$HOP_SCRIPT" <<EOF
+#!/usr/bin/env bash
+# 由 cgg-vless-hysteria2.sh 自动生成，请勿手工修改
+set -u
+
+PORT='${PORT}'
+HOP_PORTS=(${HOP_PORTS[*]})
+
+to_ipt_dport() {
+    case "\$1" in
+        *-*) printf '%s\n' "\${1/-/:}" ;;
+        *)   printf '%s\n' "\$1" ;;
+    esac
+}
+
+start_rules() {
+    local item dport
+    if command -v iptables >/dev/null 2>&1; then
+        for item in "\${HOP_PORTS[@]}"; do
+            dport="\$(to_ipt_dport "\$item")"
+            iptables -t nat -C PREROUTING -p udp --dport "\$dport" -j REDIRECT --to-ports "\$PORT" 2>/dev/null \\
+                || iptables -t nat -A PREROUTING -p udp --dport "\$dport" -j REDIRECT --to-ports "\$PORT"
+        done
+        return 0
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        nft list table inet cgg-hop >/dev/null 2>&1 || nft add table inet cgg-hop
+        nft list chain inet cgg-hop prerouting >/dev/null 2>&1 \\
+            || nft add chain inet cgg-hop prerouting '{ type nat hook prerouting priority dstnat ; policy accept ; }'
+        nft flush chain inet cgg-hop prerouting
+        for item in "\${HOP_PORTS[@]}"; do
+            nft add rule inet cgg-hop prerouting udp dport "\$item" redirect to :"\$PORT"
+        done
+        return 0
+    fi
+    echo "[WARN] 未检测到 iptables / nftables，端口跳跃未生效" >&2
+    return 1
+}
+
+stop_rules() {
+    local item dport
+    if command -v iptables >/dev/null 2>&1; then
+        for item in "\${HOP_PORTS[@]}"; do
+            dport="\$(to_ipt_dport "\$item")"
+            iptables -t nat -D PREROUTING -p udp --dport "\$dport" -j REDIRECT --to-ports "\$PORT" 2>/dev/null || true
+        done
+        return 0
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet cgg-hop 2>/dev/null || true
+    fi
+}
+
+case "\${1:-start}" in
+    start) start_rules ;;
+    stop)  stop_rules ;;
+    *)     echo "用法: \$0 {start|stop}" >&2; exit 2 ;;
+esac
+EOF
+
+    chmod 755 "$HOP_SCRIPT"
+
+    cat > "$HOP_SERVICE_FILE" <<EOF
+[Unit]
+Description=cgg-vless Hysteria2 port hopping
+After=network-online.target
+Wants=network-online.target
+Before=${SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash ${HOP_SCRIPT} start
+ExecStop=/bin/bash ${HOP_SCRIPT} stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 644 "$HOP_SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}-hop" >/dev/null 2>&1 \
+        || warn "设置端口跳跃开机自启失败"
+    if systemctl restart "${SERVICE_NAME}-hop"; then
+        log "端口跳跃已生效：${HOP_SPEC} -> ${PORT}/udp"
+    else
+        warn "端口跳跃规则应用失败，请检查 iptables / nftables"
+    fi
+}
+
 # ------------------------------ 元信息 ----------------------------------------
 save_info() {
     install -d -m 755 -o root -g root "$SINGBOX_DIR"
@@ -525,14 +689,20 @@ save_info() {
         printf 'DOMAIN=%s\n' "$DOMAIN"
         printf 'PASSWORD=%s\n' "$PASSWORD"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
+        printf 'HOP=%s\n' "$HOP_SPEC"
     } > "$INFO_FILE"
     chmod 600 "$INFO_FILE"
 }
 
 # ------------------------------ 输出结果 --------------------------------------
 print_result() {
-    local ip link pin
+    local ip link pin mport_q
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
+
+    mport_q=""
+    if [[ -n "$HOP_SPEC" ]]; then
+        mport_q="&mport=${HOP_SPEC}"
+    fi
 
     # 与 233boy 一致：用证书 SHA-256 指纹生成 pinSHA256，客户端可固定证书
     pin=""
@@ -542,10 +712,10 @@ print_result() {
     fi
 
     if [[ -n "$pin" ]]; then
-        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1&pinSHA256=${pin}#${NODE_NAME}"
+        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1${mport_q}&pinSHA256=${pin}#${NODE_NAME}"
     else
         warn "未能计算证书 SHA-256 指纹，分享链接不含 pinSHA256"
-        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1#${NODE_NAME}"
+        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1${mport_q}#${NODE_NAME}"
     fi
 
     printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
@@ -553,6 +723,9 @@ print_result() {
     printf '  节点名称    : %s\n' "$NODE_NAME"
     printf '  地址 (IP)   : %s\n' "$ip"
     printf '  UDP 端口    : %s\n' "$PORT"
+    if [[ -n "$HOP_SPEC" ]]; then
+        printf '  端口跳跃    : %s\n' "$HOP_SPEC"
+    fi
     printf '  域名 / SNI  : %s\n' "$DOMAIN"
     printf '  密码        : %s\n' "$PASSWORD"
     printf '  ALPN        : h3\n'
@@ -577,6 +750,9 @@ print_result() {
     printf '  - Hysteria 2 基于 QUIC/UDP，客户端需支持：sing-box / mihomo(Clash.Meta) / 官方 Hysteria 2\n'
     printf '  - 无法套 Cloudflare CDN，必须客户端直连\n'
     printf '  - NAT 机器需在服务商面板把 UDP 外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
+    if [[ -n "$HOP_SPEC" ]]; then
+        printf '  - 端口跳跃需在服务商安全组放行 UDP %s，客户端链接已带 mport 参数\n' "$HOP_SPEC"
+    fi
     printf '  - 自签证书需客户端开启“跳过证书验证（allowInsecure）”，或用 pinSHA256 固定证书指纹\n'
 }
 
@@ -604,6 +780,7 @@ main() {
     write_service
     verify_runtime
     configure_firewall
+    install_port_hopping
     save_info
 
     SERVER_IP="$(get_public_ip)"
