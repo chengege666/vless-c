@@ -21,6 +21,8 @@ readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly RUN_USER="nobody"
 readonly RUN_GROUP="nogroup"
 readonly DEFAULT_NODE_NAME="cgg-anytls"
+# 域名默认值：自签场景下仅作 SNI 伪装，无需真实解析
+readonly DEFAULT_DOMAIN="www.bing.com"
 
 # ------------------------------ 运行期变量 ------------------------------------
 PORT=""
@@ -187,11 +189,10 @@ validate_domain() {
 ask_domain() {
     local input
     while true; do
-        read -r -p "证书域名 / SNI（如 ws.example.com）：" input
+        read -r -p "证书域名 / SNI（回车默认 ${DEFAULT_DOMAIN}；CA 证书请填真实域名）：" input
         input="${input//[[:space:]]/}"
         if [[ -z "$input" ]]; then
-            warn "域名不能为空"
-            continue
+            input="$DEFAULT_DOMAIN"
         fi
         if ! validate_domain "$input"; then
             warn "域名格式不合法：${input}"
