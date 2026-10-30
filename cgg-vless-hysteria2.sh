@@ -21,6 +21,7 @@ readonly XRAY_CERT_DIR="/usr/local/etc/xray/cert"
 readonly RUN_USER="nobody"
 readonly RUN_GROUP="nogroup"
 readonly DEFAULT_NODE_NAME="cgg-hysteria2"
+readonly DEFAULT_DOMAIN="cloud.tencent.com"
 
 # ------------------------------ 运行期变量 ------------------------------------
 PORT=""
@@ -83,7 +84,7 @@ check_network() {
     fi
 }
 
-# 交互环境检查：本脚本必须交互输入域名与证书路径
+# 交互环境检查：本脚本必须交互输入端口与节点名称
 require_tty() {
     if [[ ! -t 0 ]]; then
         die "本脚本需要交互输入，请在终端中直接运行"
@@ -186,11 +187,10 @@ validate_domain() {
 ask_domain() {
     local input
     while true; do
-        read -r -p "证书域名 / SNI（如 hy2.example.com）：" input
+        read -r -p "证书域名 / SNI（自签回车默认 ${DEFAULT_DOMAIN}）：" input
         input="${input//[[:space:]]/}"
         if [[ -z "$input" ]]; then
-            warn "域名不能为空"
-            continue
+            input="$DEFAULT_DOMAIN"
         fi
         if ! validate_domain "$input"; then
             warn "域名格式不合法：${input}"
@@ -250,56 +250,58 @@ fix_key_permission() {
     chmod 640 "$key" 2>/dev/null || warn "无法修改私钥权限：${key}"
 }
 
-setup_cert_manual() {
-    local cert key
-    read -r -p "证书文件路径（.cer / fullchain.cer / .pem）：" cert
-    cert="${cert/#\~/$HOME}"
-    [[ -n "$cert" ]] || die "证书路径不能为空"
-    [[ -s "$cert" ]] || die "证书文件不存在或为空：${cert}"
-
-    read -r -p "私钥文件路径（.key）：" key
-    key="${key/#\~/$HOME}"
-    [[ -n "$key" ]] || die "私钥路径不能为空"
-    [[ -s "$key" ]] || die "私钥文件不存在或为空：${key}"
-
+# 使用 sing-box 自带生成器生成自签证书（与 233boy 写法一致，默认 456 个月）
+gen_self_signed_cert() {
     install -d -m 755 -o root -g root "$CERT_DIR"
-    cp -f "$cert" "${CERT_DIR}/fullchain.pem" || die "复制证书失败"
-    cp -f "$key" "${CERT_DIR}/privkey.pem" || die "复制私钥失败"
+
+    # 与 233boy 一致：证书已存在时直接复用，避免重跑安装后客户端 pin 失效
+    if [[ -s "${CERT_DIR}/fullchain.pem" && -s "${CERT_DIR}/privkey.pem" ]]; then
+        CERT_FILE="${CERT_DIR}/fullchain.pem"
+        KEY_FILE="${CERT_DIR}/privkey.pem"
+        chmod 644 "$CERT_FILE"
+        fix_key_permission "$KEY_FILE"
+        log "复用已有证书：${CERT_DIR}"
+        return 0
+    fi
+
+    local tmpdir tmp
+    tmpdir="$(mktemp -d)" || die "无法创建临时目录"
+    tmp="${tmpdir}/tls.pem"
+
+    if ! "$SINGBOX_BIN" generate tls-keypair "$tmp" -m 456 >/dev/null 2>&1 \
+        || ! grep -q 'BEGIN CERTIFICATE' "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        # 兼容不支持 -m 参数的旧版本
+        if ! "$SINGBOX_BIN" generate tls-keypair "$tmp" >/dev/null 2>&1 \
+            || ! grep -q 'BEGIN CERTIFICATE' "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            # 兼容把 PEM 输出到标准输出的版本
+            if ! "$SINGBOX_BIN" generate tls-keypair -m 456 >"$tmp" 2>/dev/null \
+                || ! grep -q 'BEGIN CERTIFICATE' "$tmp" 2>/dev/null; then
+                rm -rf "$tmpdir"
+                die "sing-box 自签证书生成失败，请确认当前 sing-box 支持 generate tls-keypair"
+            fi
+        fi
+    fi
+
+    awk '/BEGIN.*PRIVATE KEY/,/END.*PRIVATE KEY/' "$tmp" > "${CERT_DIR}/privkey.pem"
+    awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$tmp" > "${CERT_DIR}/fullchain.pem"
+    rm -rf "$tmpdir"
+
+    if [[ ! -s "${CERT_DIR}/privkey.pem" || ! -s "${CERT_DIR}/fullchain.pem" ]]; then
+        die "自签证书拆分失败：${CERT_DIR}"
+    fi
     chmod 644 "${CERT_DIR}/fullchain.pem"
     fix_key_permission "${CERT_DIR}/privkey.pem"
 
     CERT_FILE="${CERT_DIR}/fullchain.pem"
     KEY_FILE="${CERT_DIR}/privkey.pem"
-    log "证书已复制到：${CERT_DIR}"
+    log "已生成 sing-box 自签证书（456 个月）：${CERT_DIR}"
 }
 
 ask_cert_source() {
-    local ans
-    if [[ -s "${XRAY_CERT_DIR}/fullchain.pem" && -s "${XRAY_CERT_DIR}/privkey.pem" ]]; then
-        log "检测到 Xray 证书目录已有证书"
-        read -r -p "直接复用 /usr/local/etc/xray/cert 下的证书？[Y/n]：" ans
-        case "$ans" in
-            [Nn]*)
-                setup_cert_manual
-                ;;
-            *)
-                CERT_FILE="${XRAY_CERT_DIR}/fullchain.pem"
-                KEY_FILE="${XRAY_CERT_DIR}/privkey.pem"
-                fix_key_permission "$KEY_FILE"
-                log "使用已有证书：${CERT_FILE}"
-                ;;
-        esac
-        return 0
-    fi
-
-    warn "未检测到 ${XRAY_CERT_DIR} 下的证书"
-    printf '  1) 手动输入证书文件路径（.cer / .key）\n'
-    printf '  2) 取消，先去总菜单第 11 项申请证书\n'
-    read -r -p "请选择 [1-2]：" ans
-    case "$ans" in
-        1) setup_cert_manual ;;
-        *) die "已取消：请先在总菜单第 11 项申请证书，或准备好证书文件后重跑" ;;
-    esac
+    # 与 233boy 一致：不再询问证书来源，固定使用 sing-box 自签证书
+    gen_self_signed_cert
 }
 
 # ------------------------------ 密码生成 --------------------------------------
@@ -477,9 +479,22 @@ save_info() {
 
 # ------------------------------ 输出结果 --------------------------------------
 print_result() {
-    local ip link
+    local ip link pin
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3#${NODE_NAME}"
+
+    # 与 233boy 一致：用证书 SHA-256 指纹生成 pinSHA256，客户端可固定证书
+    pin=""
+    if [[ -f "$CERT_FILE" ]] && command -v openssl >/dev/null 2>&1; then
+        pin="$(openssl x509 -noout -fingerprint -sha256 -in "$CERT_FILE" 2>/dev/null \
+            | sed 's/.*=//;s/://g' || true)"
+    fi
+
+    if [[ -n "$pin" ]]; then
+        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1&pinSHA256=${pin}#${NODE_NAME}"
+    else
+        warn "未能计算证书 SHA-256 指纹，分享链接不含 pinSHA256"
+        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1#${NODE_NAME}"
+    fi
 
     printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : Hysteria 2（sing-box，QUIC/UDP）\n'
@@ -489,6 +504,9 @@ print_result() {
     printf '  域名 / SNI  : %s\n' "$DOMAIN"
     printf '  密码        : %s\n' "$PASSWORD"
     printf '  ALPN        : h3\n'
+    if [[ -n "${pin:-}" ]]; then
+        printf '  证书指纹    : %s\n' "$pin"
+    fi
     printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
     printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
@@ -507,7 +525,7 @@ print_result() {
     printf '  - Hysteria 2 基于 QUIC/UDP，客户端需支持：sing-box / mihomo(Clash.Meta) / 官方 Hysteria 2\n'
     printf '  - 无法套 Cloudflare CDN，必须客户端直连\n'
     printf '  - NAT 机器需在服务商面板把 UDP 外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
-    printf '  - 证书域名需与 SNI 一致，否则客户端会校验证书失败\n'
+    printf '  - 自签证书需客户端开启“跳过证书验证（allowInsecure）”，或用 pinSHA256 固定证书指纹\n'
 }
 
 # ------------------------------ 主流程 ----------------------------------------
