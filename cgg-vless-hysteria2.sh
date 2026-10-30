@@ -264,25 +264,25 @@ gen_self_signed_cert() {
         return 0
     fi
 
-    local tmpdir tmp
+    # sing-box 的 generate tls-keypair 参数是 server_name，PEM 直接输出到 stdout
+    local tmpdir tmp err
     tmpdir="$(mktemp -d)" || die "无法创建临时目录"
     tmp="${tmpdir}/tls.pem"
+    err="${tmpdir}/err.log"
 
-    if ! "$SINGBOX_BIN" generate tls-keypair "$tmp" -m 456 >/dev/null 2>&1 \
+    if ! "$SINGBOX_BIN" generate tls-keypair "$DOMAIN" -m 456 >"$tmp" 2>"$err" \
         || ! grep -q 'BEGIN CERTIFICATE' "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         # 兼容不支持 -m 参数的旧版本
-        if ! "$SINGBOX_BIN" generate tls-keypair "$tmp" >/dev/null 2>&1 \
+        if ! "$SINGBOX_BIN" generate tls-keypair "$DOMAIN" >"$tmp" 2>"$err" \
             || ! grep -q 'BEGIN CERTIFICATE' "$tmp" 2>/dev/null; then
-            rm -f "$tmp"
-            # 兼容把 PEM 输出到标准输出的版本
-            if ! "$SINGBOX_BIN" generate tls-keypair -m 456 >"$tmp" 2>/dev/null \
-                || ! grep -q 'BEGIN CERTIFICATE' "$tmp" 2>/dev/null; then
-                rm -rf "$tmpdir"
-                die "sing-box 自签证书生成失败，请确认当前 sing-box 支持 generate tls-keypair"
-            fi
+            local reason
+            reason="$(head -n 3 "$err" 2>/dev/null | tr '\n' ' ' || true)"
+            rm -rf "$tmpdir"
+            die "sing-box 自签证书生成失败（版本：$("$SINGBOX_BIN" version 2>/dev/null | head -n 1)），原因：${reason:-未知}"
         fi
     fi
+    rm -f "$err"
 
     awk '/BEGIN.*PRIVATE KEY/,/END.*PRIVATE KEY/' "$tmp" > "${CERT_DIR}/privkey.pem"
     awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$tmp" > "${CERT_DIR}/fullchain.pem"
