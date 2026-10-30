@@ -27,6 +27,7 @@ readonly DEFAULT_DOMAIN="cloud.tencent.com"
 PORT=""
 DOMAIN=""
 PASSWORD=""
+OBFS_PASSWORD=""
 NODE_NAME=""
 CERT_FILE=""
 KEY_FILE=""
@@ -403,7 +404,19 @@ write_config() {
         ],
         "certificate_path": "${CERT_FILE}",
         "key_path": "${KEY_FILE}"
-      }
+      },
+      "obfs": {
+        "type": "salamander",
+        "password": "${OBFS_PASSWORD}"
+      },
+      "masquerade": {
+        "enabled": true,
+        "type": "proxy",
+        "proxy": {
+          "url": "https://www.bing.com"
+        }
+      },
+      "ignore_client_bandwidth": false
     }
   ],
   "outbounds": [
@@ -542,10 +555,10 @@ print_result() {
     fi
 
     if [[ -n "$pin" ]]; then
-        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1&pinSHA256=${pin}#${NODE_NAME}"
+        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1&obfs=salamander&obfs-password=${OBFS_PASSWORD}&pinSHA256=${pin}#${NODE_NAME}"
     else
         warn "未能计算证书 SHA-256 指纹，分享链接不含 pinSHA256"
-        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1#${NODE_NAME}"
+        link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3&insecure=1&allowInsecure=1&obfs=salamander&obfs-password=${OBFS_PASSWORD}#${NODE_NAME}"
     fi
 
     printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
@@ -555,6 +568,7 @@ print_result() {
     printf '  UDP 端口    : %s\n' "$PORT"
     printf '  域名 / SNI  : %s\n' "$DOMAIN"
     printf '  密码        : %s\n' "$PASSWORD"
+    printf '  混淆 (obfs) : salamander / %s\n' "$OBFS_PASSWORD"
     printf '  ALPN        : h3\n'
     if [[ -n "${pin:-}" ]]; then
         printf '  证书指纹    : %s\n' "$pin"
@@ -599,6 +613,12 @@ main() {
 
     ask_cert_source
     gen_password
+
+    # 生成 obfs 混淆密钥（salamander）
+    OBFS_PASSWORD="$(openssl rand -hex 12 2>/dev/null || true)"
+    if [[ -z "$OBFS_PASSWORD" ]]; then
+        OBFS_PASSWORD="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' || true)"
+    fi
 
     write_config
     write_service
