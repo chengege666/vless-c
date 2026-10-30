@@ -300,8 +300,60 @@ gen_self_signed_cert() {
 }
 
 ask_cert_source() {
-    # 与 233boy 一致：不再询问证书来源，固定使用 sing-box 自签证书
-    gen_self_signed_cert
+    local ans
+    printf '\n证书来源：\n'
+    printf '  1) sing-box 自签（推荐，无需真实域名，回车默认）\n'
+    if [[ -s "${XRAY_CERT_DIR}/fullchain.pem" && -s "${XRAY_CERT_DIR}/privkey.pem" ]]; then
+        printf '  2) 复用 Xray 证书：%s\n' "$XRAY_CERT_DIR"
+    else
+        printf '  2) 复用 Xray 证书（未检测到 Xray 证书）\n'
+    fi
+    printf '  3) 手动输入 .cer / .key 路径\n'
+    read -r -p "请选择 [1-3]（回车 = 1）：" ans
+    case "$ans" in
+        ""|1)
+            gen_self_signed_cert
+            ;;
+        2)
+            if [[ -s "${XRAY_CERT_DIR}/fullchain.pem" && -s "${XRAY_CERT_DIR}/privkey.pem" ]]; then
+                CERT_FILE="${XRAY_CERT_DIR}/fullchain.pem"
+                KEY_FILE="${XRAY_CERT_DIR}/privkey.pem"
+                fix_key_permission "$KEY_FILE"
+                log "使用已有 Xray 证书：${CERT_FILE}"
+            else
+                die "未检测到 Xray 证书：${XRAY_CERT_DIR}"
+            fi
+            ;;
+        3)
+            setup_cert_manual
+            ;;
+        *)
+            die "无效选择：${ans}"
+            ;;
+    esac
+}
+
+setup_cert_manual() {
+    local cert key
+    read -r -p "证书文件路径（.cer / fullchain.cer / .pem）：" cert
+    cert="${cert/#\~/$HOME}"
+    [[ -n "$cert" ]] || die "证书路径不能为空"
+    [[ -s "$cert" ]] || die "证书文件不存在或为空：${cert}"
+
+    read -r -p "私钥文件路径（.key）：" key
+    key="${key/#\~/$HOME}"
+    [[ -n "$key" ]] || die "私钥路径不能为空"
+    [[ -s "$key" ]] || die "私钥文件不存在或为空：${key}"
+
+    install -d -m 755 -o root -g root "$CERT_DIR"
+    cp -f "$cert" "${CERT_DIR}/fullchain.pem" || die "复制证书失败"
+    cp -f "$key" "${CERT_DIR}/privkey.pem" || die "复制私钥失败"
+    chmod 644 "${CERT_DIR}/fullchain.pem"
+    fix_key_permission "${CERT_DIR}/privkey.pem"
+
+    CERT_FILE="${CERT_DIR}/fullchain.pem"
+    KEY_FILE="${CERT_DIR}/privkey.pem"
+    log "证书已复制到：${CERT_DIR}"
 }
 
 # ------------------------------ 密码生成 --------------------------------------
