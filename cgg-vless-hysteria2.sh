@@ -410,7 +410,6 @@ write_config() {
         "password": "${OBFS_PASSWORD}"
       },
       "masquerade": {
-        "enabled": true,
         "type": "proxy",
         "proxy": {
           "url": "https://www.bing.com"
