@@ -18,8 +18,6 @@ readonly ANYTLS_CONFIG="${SINGBOX_DIR}/config.json"
 readonly SERVICE_NAME="cgg-hysteria2"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly XRAY_CERT_DIR="/usr/local/etc/xray/cert"
-readonly RUN_USER="nobody"
-readonly RUN_GROUP="nogroup"
 readonly DEFAULT_NODE_NAME="cgg-hysteria2"
 # 域名默认值：自签场景下仅作 SNI 伪装，无需真实解析
 readonly DEFAULT_DOMAIN="www.bing.com"
@@ -90,7 +88,6 @@ check_network() {
     fi
 }
 
-# 交互环境检查：本脚本必须交互输入域名与证书路径
 require_tty() {
     if [[ ! -t 0 ]]; then
         die "本脚本需要交互输入，请在终端中直接运行"
@@ -98,7 +95,6 @@ require_tty() {
 }
 
 # ------------------------------ 公网 IP ---------------------------------------
-# 判断是否为可用于分享链接的公网 IPv4（排除私网 / 保留 / 组播地址）
 is_public_ipv4() {
     local ip="$1" a b c d
     [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
@@ -126,7 +122,6 @@ get_public_ip() {
     if [[ -z "$ip" ]]; then
         ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     fi
-    # hostname -I 兜底在 NAT 机器上可能拿到内网地址，不可用于分享链接
     if [[ -n "$ip" ]] && ! is_public_ipv4 "$ip"; then
         warn "获取到的地址 ${ip} 不是公网 IPv4（NAT/内网环境），分享链接将显示占位符，请手动替换为实际公网 IP"
         ip=""
@@ -146,7 +141,6 @@ detect_arch() {
 }
 
 # ------------------------------ 下载加速 --------------------------------------
-# 将原始 GitHub 地址转换为镜像地址；GH_MIRROR 为空时原样返回
 mirror_url() {
     local url="$1"
     if [[ -n "$GH_MIRROR" ]]; then
@@ -157,11 +151,25 @@ mirror_url() {
 }
 
 # ------------------------------ 端口检查 --------------------------------------
-# Hysteria 2 基于 QUIC/UDP，端口冲突检测必须针对 UDP
 port_in_use_udp() {
     local port="$1"
     command -v ss >/dev/null 2>&1 || return 1
     ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+}
+
+# ------------------------------ 内核 UDP 优化 ---------------------------------
+optimize_udp_buffer() {
+    log "配置 Linux 内核 UDP 缓冲区大小（防止 QUIC 握手丢包）..."
+    sysctl -w net.core.rmem_max=8388608 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=8388608 >/dev/null 2>&1 || true
+    
+    local sysctl_conf="/etc/sysctl.d/99-hysteria2.conf"
+    if [[ ! -f "$sysctl_conf" ]]; then
+        cat > "$sysctl_conf" <<EOF
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+EOF
+    fi
 }
 
 # ------------------------------ 安装 sing-box ---------------------------------
@@ -170,12 +178,11 @@ install_singbox() {
         local cur_line cur_major=0 cur_minor=0
         cur_line="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 || true)"
         log "检测到已安装 sing-box：${cur_line}"
-        # hysteria2 入站自 1.8 起提供，版本过低时提前中止，避免写出无法加载的配置
         if [[ "$cur_line" =~ ([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
             cur_major=$((10#${BASH_REMATCH[1]}))
             cur_minor=$((10#${BASH_REMATCH[2]}))
             if (( cur_major < 1 || (cur_major == 1 && cur_minor < 8) )); then
-                die "已安装的 sing-box 版本过低，hysteria2 入站需要 1.8+；请升级，或删除 ${SINGBOX_BIN} 后重跑（脚本会自动下载最新版）"
+                die "已安装的 sing-box 版本过低，hysteria2 入站需要 1.8+；请升级，或删除 ${SINGBOX_BIN} 后重跑"
             fi
         fi
         return 0
@@ -258,7 +265,7 @@ validate_domain() {
 ask_domain() {
     local input
     while true; do
-        read -r -p "证书域名 / SNI（回车默认 ${DEFAULT_DOMAIN}；CA 证书请填真实域名）：" input
+        read -r -p "证书域名 / SNI（自签回车默认 ${DEFAULT_DOMAIN}；使用真实 CA 证书请务必填真实域名）：" input
         input="${input//[[:space:]]/}"
         if [[ -z "$input" ]]; then
             input="$DEFAULT_DOMAIN"
@@ -275,10 +282,9 @@ ask_domain() {
 
 ask_port() {
     local input
-    command -v ss >/dev/null 2>&1 || warn "未检测到 ss（iproute2），将跳过 UDP 端口占用检测，请自行确认端口未被占用"
-    read -r -p "UDP 监听端口（1-65535，回车默认 443；可空格分隔多个端口实现端口跳跃，第一个为主监听端口，其余为跳跃端口）：" input
+    command -v ss >/dev/null 2>&1 || warn "未检测到 ss，将跳过 UDP 端口占用检测"
+    read -r -p "UDP 监听端口（1-65535，回车默认 443；可空格分隔多个端口实现端口跳跃）：" input
 
-    # 按空白切分；纯空格输入等价于空输入（herestring 自带换行，read 必然返回 0）
     local -a ports=()
     read -r -a ports <<< "$input"
 
@@ -295,14 +301,12 @@ ask_port() {
             if [[ ! "$p" =~ ^[0-9]+$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then
                 die "端口不合法：${p}"
             fi
-            # 去掉前导零（如 0443 -> 443），避免写入 JSON / iptables 时格式非法
             p=$((10#$p))
             case " $seen " in
                 *" $p "*) die "端口重复：${p}" ;;
             esac
             seen="${seen} ${p}"
             if port_in_use_udp "$p"; then
-                # 占用者可能是本服务自身：先停止本服务释放端口，便于重装/变更配置
                 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
                     warn "检测到 ${SERVICE_NAME} 正在运行且占用 UDP 端口，先停止服务后继续"
                     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -314,12 +318,10 @@ ask_port() {
             fi
             norm+=("$p")
         done
-        # 第一个端口为主监听端口（写入 listen_port），其余为跳跃端口
         PORT="${norm[0]}"
         HOP_PORTS="${norm[*]:1}"
     fi
 
-    # AnyTLS 为 TCP，同号端口本质可共存，仅提示避免误判
     if [[ -f "$ANYTLS_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
         local aport
         aport="$(jq -r '.inbounds[0].listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null || true)"
@@ -339,7 +341,6 @@ ask_node_name() {
     local input
     NODE_NAME="$DEFAULT_NODE_NAME"
     read -r -p "节点名称（显示在客户端备注，回车默认 ${DEFAULT_NODE_NAME}）：" input
-    # 去掉分隔符与空白，避免破坏 hysteria2:// 链接格式
     input="${input//[#?&%/]/}"
     input="${input// /_}"
     if [[ -n "$input" ]]; then
@@ -349,12 +350,6 @@ ask_node_name() {
 }
 
 # ------------------------------ 证书处理 --------------------------------------
-fix_key_permission() {
-    local key="$1"
-    chown root:"$RUN_GROUP" "$key" 2>/dev/null || warn "无法修改私钥属组：${key}"
-    chmod 640 "$key" 2>/dev/null || warn "无法修改私钥权限：${key}"
-}
-
 setup_cert_manual() {
     local cert key
     read -r -p "证书文件路径（.cer / fullchain.cer / .pem）：" cert
@@ -371,7 +366,7 @@ setup_cert_manual() {
     cp -f "$cert" "${CERT_DIR}/fullchain.pem" || die "复制证书失败"
     cp -f "$key" "${CERT_DIR}/privkey.pem" || die "复制私钥失败"
     chmod 644 "${CERT_DIR}/fullchain.pem"
-    fix_key_permission "${CERT_DIR}/privkey.pem"
+    chmod 600 "${CERT_DIR}/privkey.pem"
 
     CERT_FILE="${CERT_DIR}/fullchain.pem"
     KEY_FILE="${CERT_DIR}/privkey.pem"
@@ -379,20 +374,22 @@ setup_cert_manual() {
     log "证书已复制到：${CERT_DIR}"
 }
 
-# 生成自签证书：客户端需开启“跳过证书验证 / allowInsecure”
+# 生成自签证书：必须补充 SAN 扩展，以兼容现代 Go TLS 客户端
 setup_cert_selfsigned() {
     command -v openssl >/dev/null 2>&1 || die "缺少 openssl，无法生成自签证书，请先安装：apt-get install -y openssl"
 
     install -d -m 755 -o root -g root "$CERT_DIR"
-    log "生成自签证书（CN=${DOMAIN}，有效期 3650 天）..."
+    log "生成自签证书（含 SAN 扩展，CN=${DOMAIN}，有效期 3650 天）..."
     if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -keyout "${CERT_DIR}/privkey.pem" \
         -out "${CERT_DIR}/fullchain.pem" \
-        -days 3650 -subj "/CN=${DOMAIN}" >/dev/null 2>&1; then
+        -days 3650 \
+        -subj "/CN=${DOMAIN}" \
+        -addext "subjectAltName=DNS:${DOMAIN}" >/dev/null 2>&1; then
         die "自签证书生成失败"
     fi
     chmod 644 "${CERT_DIR}/fullchain.pem"
-    fix_key_permission "${CERT_DIR}/privkey.pem"
+    chmod 600 "${CERT_DIR}/privkey.pem"
 
     CERT_FILE="${CERT_DIR}/fullchain.pem"
     KEY_FILE="${CERT_DIR}/privkey.pem"
@@ -416,16 +413,15 @@ ask_cert_source() {
                 setup_cert_selfsigned
                 ;;
             *)
-                # 复制一份使用，避免改动 Xray 原有证书文件的属组/权限影响现有节点
                 install -d -m 755 -o root -g root "$CERT_DIR"
                 cp -f "${XRAY_CERT_DIR}/fullchain.pem" "${CERT_DIR}/fullchain.pem" || die "复制 Xray 证书失败"
                 cp -f "${XRAY_CERT_DIR}/privkey.pem" "${CERT_DIR}/privkey.pem" || die "复制 Xray 私钥失败"
                 chmod 644 "${CERT_DIR}/fullchain.pem"
-                fix_key_permission "${CERT_DIR}/privkey.pem"
+                chmod 600 "${CERT_DIR}/privkey.pem"
                 CERT_FILE="${CERT_DIR}/fullchain.pem"
                 KEY_FILE="${CERT_DIR}/privkey.pem"
                 CERT_MODE="reuse"
-                log "已复制 Xray 证书到 ${CERT_DIR}（原证书文件未改动）"
+                log "已复制 Xray 证书到 ${CERT_DIR}"
                 ;;
         esac
         return 0
@@ -434,12 +430,12 @@ ask_cert_source() {
     warn "未检测到 ${XRAY_CERT_DIR} 下的证书"
     printf '  1) 手动输入证书文件路径（.cer / .key）\n'
     printf '  2) 生成自签证书（客户端需跳过证书验证）\n'
-    printf '  3) 取消，先去总菜单第 11 项申请证书\n'
+    printf '  3) 取消，先去申请证书\n'
     read -r -p "请选择 [1-3]：" ans
     case "$ans" in
         1) setup_cert_manual ;;
         2) setup_cert_selfsigned ;;
-        *) die "已取消：请先在总菜单第 11 项申请证书，或准备好证书文件后重跑" ;;
+        *) die "已取消安装" ;;
     esac
 }
 
@@ -454,6 +450,7 @@ gen_password() {
 }
 
 # ------------------------------ 配置写入 --------------------------------------
+# 移除入站 tls 中的 server_name 与 alpn，避免对 SNI 强校验导致握手被 sing-box 主动阻断
 write_config() {
     install -d -m 755 -o root -g root "$SINGBOX_DIR"
 
@@ -463,7 +460,6 @@ write_config() {
         log "旧配置已备份：${backup}"
     fi
 
-    # ALPN 固定 h3，与官方 Hysteria 2 默认值一致；UDP 转发由 QUIC 原生承载
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
@@ -474,7 +470,7 @@ write_config() {
     {
       "type": "hysteria2",
       "tag": "hysteria2-in",
-      "listen": "0.0.0.0",
+      "listen": "::",
       "listen_port": ${PORT},
       "users": [
         {
@@ -484,10 +480,6 @@ write_config() {
       ],
       "tls": {
         "enabled": true,
-        "server_name": "${DOMAIN}",
-        "alpn": [
-          "h3"
-        ],
         "certificate_path": "${CERT_FILE}",
         "key_path": "${KEY_FILE}"
       }
@@ -502,24 +494,18 @@ write_config() {
 }
 EOF
 
-    # sing-box 以 nobody 运行，配置需属组可读（含密码，仍限制其他用户）
-    chown root:"$RUN_GROUP" "$CONFIG_FILE" 2>/dev/null || warn "无法修改配置属组：${CONFIG_FILE}"
-    chmod 640 "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
 
     if ! "$SINGBOX_BIN" check -c "$CONFIG_FILE"; then
-        die "sing-box 配置校验失败，未启动服务（请确认 sing-box 版本支持 hysteria2）"
+        die "sing-box 配置校验失败，未启动服务"
     fi
     log "配置写入并校验通过：${CONFIG_FILE}"
 }
 
 # ------------------------------ 端口跳跃 --------------------------------------
-# sing-box 服务端不支持原生多端口监听，采用业界标准做法：
-# 主端口正常监听，跳跃端口通过 iptables REDIRECT 转发到主端口，
-# 客户端依据分享链接中的 mport 参数随机选口、自动切换
 setup_port_hopping() {
     local p
 
-    # 清理上次安装遗留的旧端口规则（依据 info 文件记录），避免更换端口后规则残留
     if command -v iptables >/dev/null 2>&1 && [[ -f "$INFO_FILE" ]]; then
         local old_port="" old_hops="" cur_ports=" $PORT $HOP_PORTS "
         old_port="$(sed -n 's/^PORT=//p' "$INFO_FILE" 2>/dev/null | head -n 1 || true)"
@@ -530,7 +516,6 @@ setup_port_hopping() {
                     iptables -t nat -D PREROUTING -p udp --dport "$p" -j REDIRECT --to-ports "$old_port" 2>/dev/null || break
                 done
             done
-            # 旧端口的 INPUT 放行规则一并清理；当前端口会在 configure_firewall 中重新放行
             for p in $old_port $old_hops; do
                 case "$cur_ports" in
                     *" $p "*) continue ;;
@@ -546,7 +531,7 @@ setup_port_hopping() {
     [[ -n "$HOP_PORTS" ]] || return 0
 
     if ! command -v iptables >/dev/null 2>&1; then
-        warn "未检测到 iptables，端口跳跃规则无法配置，请手动将端口 ${HOP_PORTS// /, } 转发到 ${PORT}/udp"
+        warn "未检测到 iptables，端口跳跃规则无法配置"
         return 0
     fi
 
@@ -561,9 +546,7 @@ setup_port_hopping() {
     persist_iptables
 }
 
-# 持久化 iptables 规则；两处调用，最后一次位于防火墙规则全部写入之后
 persist_iptables() {
-    # 持久化：优先 netfilter-persistent，其次 /etc/iptables/rules.v4；都不可用则警告
     if command -v netfilter-persistent >/dev/null 2>&1; then
         if netfilter-persistent save >/dev/null 2>&1; then
             log "iptables 规则已持久化（netfilter-persistent）"
@@ -574,22 +557,16 @@ persist_iptables() {
         if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
             log "iptables 规则已持久化（/etc/iptables/rules.v4）"
         else
-            warn "iptables-save 写入 /etc/iptables/rules.v4 失败，重启后端口跳跃规则将丢失"
+            warn "iptables-save 写入 /etc/iptables/rules.v4 失败"
         fi
     else
-        warn "未安装 iptables-persistent，重启后端口跳跃规则将丢失；可执行 apt-get install -y iptables-persistent 后重跑"
+        warn "未安装 iptables-persistent，重启后端口跳跃规则将丢失"
     fi
 }
 
 # ------------------------------ systemd 服务 ----------------------------------
+# 改用 root 用户运行，确保在任何架构环境（LXC/Docker/KVM）下均能安全绑定特权端口与加载私钥
 write_service() {
-    if [[ -f "$SERVICE_FILE" ]] && ! grep -q "cgg-hysteria2" "$SERVICE_FILE"; then
-        local backup="${SERVICE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-        cp -a "$SERVICE_FILE" "$backup"
-        log "旧服务文件已备份：${backup}"
-    fi
-
-    # Restart=on-failure 负责进程级异常重连；QUIC 连接复用与超时由 sing-box 内部处理
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=cgg-vless Hysteria 2 Service (sing-box)
@@ -598,16 +575,13 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
-User=${RUN_USER}
-Group=${RUN_GROUP}
+Type=simple
+User=root
 WorkingDirectory=${SINGBOX_DIR}
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE}
-Restart=on-failure
-RestartSec=2
-LimitNOFILE=1000000
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -643,12 +617,11 @@ verify_runtime() {
     fi
 
     if (( listening == 1 )); then
-        log "UDP 端口 ${PORT} 已监听"
+        log "UDP 端口 ${PORT} 已成功监听"
     else
         warn "未检测到 UDP 端口 ${PORT} 监听，请执行 journalctl -u ${SERVICE_NAME} -n 50 排查"
     fi
 
-    # 跳跃端口不直接监听（经 REDIRECT 转发），仅校验 iptables 规则是否生效
     if [[ -n "$HOP_PORTS" ]] && command -v iptables >/dev/null 2>&1; then
         local p missing=0
         for p in $HOP_PORTS; do
@@ -663,7 +636,7 @@ verify_runtime() {
     fi
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        log "服务状态：运行中（异常退出将自动重连）"
+        log "服务状态：运行中"
     else
         warn "服务状态：未运行"
     fi
@@ -685,14 +658,11 @@ configure_firewall() {
         for p in $all_ports; do
             if ! iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null; then
                 iptables -I INPUT -p udp --dport "$p" -j ACCEPT \
-                    || warn "iptables 放行端口失败，请手动放行 ${p}/udp"
+                    || warn "iptables 放行端口失败"
             fi
         done
-        log "iptables 已放行端口 ${all_ports// /, }/udp（如使用 firewalld 请另行放行）"
-        # 规则已全部写入，此处统一持久化，确保重启后 nat 跳跃与 INPUT 放行同时生效
+        log "iptables 已放行端口 ${all_ports// /, }/udp"
         persist_iptables
-    elif ! command -v ufw >/dev/null 2>&1; then
-        warn "未检测到 UFW / iptables，请手动放行 ${all_ports// /, }/udp"
     fi
 }
 
@@ -712,18 +682,19 @@ save_info() {
 }
 
 # ------------------------------ 输出结果 --------------------------------------
+# 修正分享链接：移除干扰客户端解析的 &alpn=h3
 print_result() {
     local ip link extra=""
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    # 端口跳跃按 Hysteria 2 URI 规范写入 mport，客户端据此随机选口、自动切换
+    
     if [[ -n "$HOP_PORTS" ]]; then
         extra="&mport=${PORT},${HOP_PORTS// /,}"
     fi
-    # 自签证书需客户端跳过证书验证，链接带 insecure=1
     if [[ "$CERT_MODE" == "selfsigned" ]]; then
         extra="${extra}&insecure=1"
     fi
-    link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}&alpn=h3${extra}#${NODE_NAME}"
+    
+    link="hysteria2://${PASSWORD}@${ip}:${PORT}/?sni=${DOMAIN}${extra}#${NODE_NAME}"
 
     printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : Hysteria 2（sing-box，QUIC/UDP）\n'
@@ -736,7 +707,6 @@ print_result() {
     fi
     printf '  域名 / SNI  : %s\n' "$DOMAIN"
     printf '  密码        : %s\n' "$PASSWORD"
-    printf '  ALPN        : h3\n'
     printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
     printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
@@ -747,21 +717,15 @@ print_result() {
             qrencode -t ANSI "$link" 2>/dev/null || warn "二维码生成失败，请直接使用上方链接"
         fi
         printf '\n'
-    else
-        warn "未安装 qrencode，跳过二维码输出"
     fi
 
     printf '%s提示：%s\n' "$C_YELLOW" "$C_RESET"
-    printf '  - Hysteria 2 基于 QUIC/UDP，客户端需支持：sing-box / mihomo(Clash.Meta) / 官方 Hysteria 2\n'
-    printf '  - 无法套 Cloudflare CDN，必须客户端直连\n'
-    printf '  - NAT 机器需在服务商面板把 UDP 外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
-    printf '  - 证书域名需与 SNI 一致，否则客户端会校验证书失败\n'
+    printf '  - Hysteria 2 基于 UDP，客户端需支持：v2rayN / sing-box / Clash.Meta(Mihomo) / Shadowrocket\n'
     if [[ "$CERT_MODE" == "selfsigned" ]]; then
-        printf '  - 当前为自签证书，客户端必须开启「跳过证书验证 / allowInsecure」\n'
+        printf '  - 当前为自签证书，客户端节点设置中请务必勾选「允许不安全证书 / 跳过证书验证(allowInsecure)」\n'
     fi
-    printf '  - 链接中地址为 IP：若客户端要求填写域名，可把 %s 换成 %s（该域名需已解析到本机）\n' "$ip" "$DOMAIN"
     if [[ -n "$HOP_PORTS" ]]; then
-        printf '  - 端口跳跃：云服务商安全组需放行跳跃端口的 UDP 流量（%s），客户端将随机选口连接\n' "${HOP_PORTS// /, }"
+        printf '  - 端口跳跃：若云服务商有安全组，请放行所有跳跃端口 UDP（%s）\n' "${HOP_PORTS// /, }"
     fi
 }
 
@@ -773,7 +737,6 @@ main() {
     check_network
 
     printf '\n%s========== cgg-vless · Hysteria 2（sing-box）==========%s\n\n' "$C_MAGENTA" "$C_RESET"
-    warn "Xray-core 不支持 Hysteria 2，本脚本复用 sing-box 后端，配置与服务独立，不影响现有节点"
 
     ask_domain
     ask_port
@@ -781,6 +744,7 @@ main() {
     ask_cert_source
     gen_password
 
+    optimize_udp_buffer
     install_singbox
     write_config
     write_service
