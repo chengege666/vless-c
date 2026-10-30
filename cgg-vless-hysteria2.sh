@@ -541,10 +541,13 @@ main() {
     ask_domain
     ask_port
     ask_node_name
+
+    # 自签证书依赖 sing-box，必须先安装
+    install_singbox
+
     ask_cert_source
     gen_password
 
-    install_singbox
     write_config
     write_service
     verify_runtime
