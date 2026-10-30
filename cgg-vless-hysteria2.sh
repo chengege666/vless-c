@@ -14,13 +14,12 @@ readonly SINGBOX_DIR="/usr/local/etc/sing-box"
 readonly CONFIG_FILE="${SINGBOX_DIR}/hysteria2.json"
 readonly INFO_FILE="${SINGBOX_DIR}/cgg-hysteria2.info"
 readonly CERT_DIR="${SINGBOX_DIR}/cert-hysteria2"
-readonly ANYTLS_CONFIG="${SINGBOX_DIR}/config.json"
 readonly SERVICE_NAME="cgg-hysteria2"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly XRAY_CERT_DIR="/usr/local/etc/xray/cert"
 readonly DEFAULT_NODE_NAME="cgg-hysteria2"
-# 域名默认值：自签场景下仅作 SNI 伪装，无需真实解析
-readonly DEFAULT_DOMAIN="www.bing.com"
+# 自签场景默认伪装 SNI
+readonly DEFAULT_DOMAIN="cloud.tencent.com"
 # GitHub 加速镜像（前缀式代理）；置空则完全直连 GitHub
 readonly GH_MIRROR="https://cgjs.1231818.xyz/"
 
@@ -33,7 +32,6 @@ CERT_FILE=""
 KEY_FILE=""
 SERVER_IP=""
 HOP_PORTS=""
-# 证书模式：reuse（复用 Xray 证书）/ manual（手动路径）/ selfsigned（自签）
 CERT_MODE=""
 
 # ------------------------------ 颜色定义 --------------------------------------
@@ -123,7 +121,7 @@ get_public_ip() {
         ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     fi
     if [[ -n "$ip" ]] && ! is_public_ipv4 "$ip"; then
-        warn "获取到的地址 ${ip} 不是公网 IPv4（NAT/内网环境），分享链接将显示占位符，请手动替换为实际公网 IP"
+        warn "获取到的地址 ${ip} 不是公网 IPv4，分享链接将显示占位符，请手动替换为实际公网 IP"
         ip=""
     fi
     printf '%s' "$ip"
@@ -140,7 +138,6 @@ detect_arch() {
     esac
 }
 
-# ------------------------------ 下载加速 --------------------------------------
 mirror_url() {
     local url="$1"
     if [[ -n "$GH_MIRROR" ]]; then
@@ -150,11 +147,23 @@ mirror_url() {
     fi
 }
 
-# ------------------------------ 端口检查 --------------------------------------
+# ------------------------------ 端口管理 --------------------------------------
 port_in_use_udp() {
     local port="$1"
     command -v ss >/dev/null 2>&1 || return 1
     ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+}
+
+# 随机生成一个 20000 - 50000 之间未被占用的端口
+get_random_port() {
+    local p
+    while true; do
+        p=$((RANDOM % 30001 + 20000))
+        if ! port_in_use_udp "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
 }
 
 # ------------------------------ 内核 UDP 优化 ---------------------------------
@@ -182,7 +191,7 @@ install_singbox() {
             cur_major=$((10#${BASH_REMATCH[1]}))
             cur_minor=$((10#${BASH_REMATCH[2]}))
             if (( cur_major < 1 || (cur_major == 1 && cur_minor < 8) )); then
-                die "已安装的 sing-box 版本过低，hysteria2 入站需要 1.8+；请升级，或删除 ${SINGBOX_BIN} 后重跑"
+                die "已安装的 sing-box 版本过低，hysteria2 入站需要 1.8+；请升级或删除 ${SINGBOX_BIN} 后重跑"
             fi
         fi
         return 0
@@ -193,7 +202,7 @@ install_singbox() {
 
     local arch tag ver url tmpdir extracted api_json=""
     if ! arch="$(detect_arch)"; then
-        die "当前架构不支持自动安装（仅支持 x86_64 / aarch64），请手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        die "当前架构不支持自动安装（仅支持 x86_64 / aarch64）"
     fi
 
     log "获取 sing-box 最新版本..."
@@ -210,7 +219,7 @@ install_singbox() {
         | grep -m1 '"tag_name"' \
         | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
     if [[ -z "$tag" ]]; then
-        die "获取 sing-box 版本失败（GitHub API 不可达），可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        die "获取 sing-box 版本失败（GitHub API 不可达），可手动下载放到 ${SINGBOX_BIN}"
     fi
 
     ver="${tag#v}"
@@ -231,7 +240,7 @@ install_singbox() {
         if ! curl -fsSL --max-time 300 --retry 2 --retry-delay 2 --connect-timeout 15 \
             -o "${tmpdir}/pkg.tar.gz" "$url"; then
             rm -rf "$tmpdir"
-            die "sing-box 下载失败，可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+            die "sing-box 下载失败"
         fi
     fi
 
@@ -265,7 +274,7 @@ validate_domain() {
 ask_domain() {
     local input
     while true; do
-        read -r -p "证书域名 / SNI（自签回车默认 ${DEFAULT_DOMAIN}；使用真实 CA 证书请务必填真实域名）：" input
+        read -r -p "证书域名 / SNI（自签回车默认 ${DEFAULT_DOMAIN}；使用真实 CA 证书请填真实域名）：" input
         input="${input//[[:space:]]/}"
         if [[ -z "$input" ]]; then
             input="$DEFAULT_DOMAIN"
@@ -281,15 +290,19 @@ ask_domain() {
 }
 
 ask_port() {
-    local input
+    local input default_p
     command -v ss >/dev/null 2>&1 || warn "未检测到 ss，将跳过 UDP 端口占用检测"
-    read -r -p "UDP 监听端口（1-65535，回车默认 443；可空格分隔多个端口实现端口跳跃）：" input
+    
+    # 动态获取一个 20000-50000 的随机安全端口作为默认值
+    default_p="$(get_random_port)"
+    
+    read -r -p "UDP 监听端口（1-65535，回车默认随机高位端口 ${default_p}；可空格分隔多个端口实现端口跳跃）：" input
 
     local -a ports=()
     read -r -a ports <<< "$input"
 
     if (( ${#ports[@]} == 0 )); then
-        PORT="443"
+        PORT="${default_p}"
         HOP_PORTS=""
     else
         if (( ${#ports[@]} > 20 )); then
@@ -320,14 +333,6 @@ ask_port() {
         done
         PORT="${norm[0]}"
         HOP_PORTS="${norm[*]:1}"
-    fi
-
-    if [[ -f "$ANYTLS_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
-        local aport
-        aport="$(jq -r '.inbounds[0].listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null || true)"
-        if [[ -n "$aport" && "$aport" == "$PORT" ]]; then
-            warn "端口 ${PORT} 与 AnyTLS 相同：TCP/UDP 可共存，若客户端异常请改用其他端口"
-        fi
     fi
 
     if [[ -n "$HOP_PORTS" ]]; then
@@ -374,7 +379,6 @@ setup_cert_manual() {
     log "证书已复制到：${CERT_DIR}"
 }
 
-# 生成自签证书：必须补充 SAN 扩展，以兼容现代 Go TLS 客户端
 setup_cert_selfsigned() {
     command -v openssl >/dev/null 2>&1 || die "缺少 openssl，无法生成自签证书，请先安装：apt-get install -y openssl"
 
@@ -431,7 +435,8 @@ ask_cert_source() {
     printf '  1) 手动输入证书文件路径（.cer / .key）\n'
     printf '  2) 生成自签证书（客户端需跳过证书验证）\n'
     printf '  3) 取消，先去申请证书\n'
-    read -r -p "请选择 [1-3]：" ans
+    read -r -p "请选择 [1-3，回车默认 2]：" ans
+    ans="${ans:-2}"
     case "$ans" in
         1) setup_cert_manual ;;
         2) setup_cert_selfsigned ;;
@@ -450,7 +455,10 @@ gen_password() {
 }
 
 # ------------------------------ 配置写入 --------------------------------------
-# 移除入站 tls 中的 server_name 与 alpn，避免对 SNI 强校验导致握手被 sing-box 主动阻断
+# 优化重点：
+# 1. 监听 0.0.0.0 避免 IPv6 栈解析异常
+# 2. 移除入站多余的 server_name 和 alpn
+# 3. direct 出站增加 domain_strategy: prefer_ipv4，彻底杜绝 IPv6 路由死锁打不开网页
 write_config() {
     install -d -m 755 -o root -g root "$SINGBOX_DIR"
 
@@ -463,14 +471,14 @@ write_config() {
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
-    "level": "warn",
+    "level": "info",
     "timestamp": true
   },
   "inbounds": [
     {
       "type": "hysteria2",
       "tag": "hysteria2-in",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": ${PORT},
       "users": [
         {
@@ -488,7 +496,8 @@ write_config() {
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct",
+      "domain_strategy": "prefer_ipv4"
     }
   ]
 }
@@ -551,7 +560,7 @@ persist_iptables() {
         if netfilter-persistent save >/dev/null 2>&1; then
             log "iptables 规则已持久化（netfilter-persistent）"
         else
-            warn "netfilter-persistent 保存失败，重启后端口跳跃规则将丢失"
+            warn "netfilter-persistent 保存失败"
         fi
     elif [[ -f /etc/iptables/rules.v4 ]] && command -v iptables-save >/dev/null 2>&1; then
         if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
@@ -559,13 +568,10 @@ persist_iptables() {
         else
             warn "iptables-save 写入 /etc/iptables/rules.v4 失败"
         fi
-    else
-        warn "未安装 iptables-persistent，重启后端口跳跃规则将丢失"
     fi
 }
 
 # ------------------------------ systemd 服务 ----------------------------------
-# 改用 root 用户运行，确保在任何架构环境（LXC/Docker/KVM）下均能安全绑定特权端口与加载私钥
 write_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -682,7 +688,6 @@ save_info() {
 }
 
 # ------------------------------ 输出结果 --------------------------------------
-# 修正分享链接：移除干扰客户端解析的 &alpn=h3
 print_result() {
     local ip link extra=""
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
@@ -719,13 +724,16 @@ print_result() {
         printf '\n'
     fi
 
-    printf '%s提示：%s\n' "$C_YELLOW" "$C_RESET"
-    printf '  - Hysteria 2 基于 UDP，客户端需支持：v2rayN / sing-box / Clash.Meta(Mihomo) / Shadowrocket\n'
+    printf '%s使用提示：%s\n' "$C_YELLOW" "$C_RESET"
+    printf '  - Hysteria 2 基于 UDP 协议，客户端请使用：v2rayN / sing-box / Clash.Meta(Mihomo) / Shadowrocket\n'
     if [[ "$CERT_MODE" == "selfsigned" ]]; then
-        printf '  - 当前为自签证书，客户端节点设置中请务必勾选「允许不安全证书 / 跳过证书验证(allowInsecure)」\n'
+        printf '  - 自签证书模式：客户端节点配置中必须开启「允许不安全证书 / 跳过证书验证(allowInsecure / skip-cert-verify)」\n'
     fi
+    printf '  - 测试注意：切勿在客户端使用 TCP Ping 测速（UDP 端口不响应 TCP），请右键使用「真连接测试 (HttpPing)」或直接开启代理打开网页测试\n'
     if [[ -n "$HOP_PORTS" ]]; then
-        printf '  - 端口跳跃：若云服务商有安全组，请放行所有跳跃端口 UDP（%s）\n' "${HOP_PORTS// /, }"
+        printf '  - 若云厂商有外部安全组，请确保放行对应 UDP 端口（%s, %s）\n' "$PORT" "${HOP_PORTS// /, }"
+    else
+        printf '  - 若云厂商有外部安全组，请确保放行 UDP 端口：%s\n' "$PORT"
     fi
 }
 
