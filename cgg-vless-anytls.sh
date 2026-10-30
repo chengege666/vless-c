@@ -30,6 +30,8 @@ NODE_NAME=""
 CERT_FILE=""
 KEY_FILE=""
 SERVER_IP=""
+# 证书模式：reuse（复用 Xray 证书）/ manual（手动路径）/ selfsigned（自签）
+CERT_MODE=""
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -271,21 +273,50 @@ setup_cert_manual() {
 
     CERT_FILE="${CERT_DIR}/fullchain.pem"
     KEY_FILE="${CERT_DIR}/privkey.pem"
+    CERT_MODE="manual"
     log "证书已复制到：${CERT_DIR}"
+}
+
+# 生成自签证书：客户端需开启“跳过证书验证 / allowInsecure”
+setup_cert_selfsigned() {
+    command -v openssl >/dev/null 2>&1 || die "缺少 openssl，无法生成自签证书，请先安装：apt-get install -y openssl"
+
+    install -d -m 755 -o root -g root "$CERT_DIR"
+    log "生成自签证书（CN=${DOMAIN}，有效期 3650 天）..."
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        -keyout "${CERT_DIR}/privkey.pem" \
+        -out "${CERT_DIR}/fullchain.pem" \
+        -days 3650 -subj "/CN=${DOMAIN}" >/dev/null 2>&1; then
+        die "自签证书生成失败"
+    fi
+    chmod 644 "${CERT_DIR}/fullchain.pem"
+    fix_key_permission "${CERT_DIR}/privkey.pem"
+
+    CERT_FILE="${CERT_DIR}/fullchain.pem"
+    KEY_FILE="${CERT_DIR}/privkey.pem"
+    CERT_MODE="selfsigned"
+    log "自签证书已生成：${CERT_DIR}"
 }
 
 ask_cert_source() {
     local ans
     if [[ -s "${XRAY_CERT_DIR}/fullchain.pem" && -s "${XRAY_CERT_DIR}/privkey.pem" ]]; then
         log "检测到 Xray 证书目录已有证书"
-        read -r -p "直接复用 /usr/local/etc/xray/cert 下的证书？[Y/n]：" ans
+        printf '  1) 复用 /usr/local/etc/xray/cert 下的证书（默认）\n'
+        printf '  2) 手动输入证书文件路径（.cer / .key）\n'
+        printf '  3) 生成自签证书（客户端需跳过证书验证）\n'
+        read -r -p "请选择 [1-3，回车默认 1]：" ans
         case "$ans" in
-            [Nn]*)
+            2)
                 setup_cert_manual
+                ;;
+            3)
+                setup_cert_selfsigned
                 ;;
             *)
                 CERT_FILE="${XRAY_CERT_DIR}/fullchain.pem"
                 KEY_FILE="${XRAY_CERT_DIR}/privkey.pem"
+                CERT_MODE="reuse"
                 fix_key_permission "$KEY_FILE"
                 log "使用已有证书：${CERT_FILE}"
                 ;;
@@ -295,10 +326,12 @@ ask_cert_source() {
 
     warn "未检测到 ${XRAY_CERT_DIR} 下的证书"
     printf '  1) 手动输入证书文件路径（.cer / .key）\n'
-    printf '  2) 取消，先去总菜单第 11 项申请证书\n'
-    read -r -p "请选择 [1-2]：" ans
+    printf '  2) 生成自签证书（客户端需跳过证书验证）\n'
+    printf '  3) 取消，先去总菜单第 11 项申请证书\n'
+    read -r -p "请选择 [1-3]：" ans
     case "$ans" in
         1) setup_cert_manual ;;
+        2) setup_cert_selfsigned ;;
         *) die "已取消：请先在总菜单第 11 项申请证书，或准备好证书文件后重跑" ;;
     esac
 }
@@ -445,6 +478,7 @@ save_info() {
         printf 'DOMAIN=%s\n' "$DOMAIN"
         printf 'PASSWORD=%s\n' "$PASSWORD"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
+        printf 'CERT_MODE=%s\n' "$CERT_MODE"
     } > "$INFO_FILE"
     chmod 600 "$INFO_FILE"
 }
@@ -453,7 +487,12 @@ save_info() {
 print_result() {
     local ip link
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="anytls://${PASSWORD}@${ip}:${PORT}?security=tls&sni=${DOMAIN}&fp=chrome#${NODE_NAME}"
+    # 自签证书需客户端跳过证书验证，链接带 insecure=1
+    link="anytls://${PASSWORD}@${ip}:${PORT}?security=tls&sni=${DOMAIN}&fp=chrome"
+    if [[ "$CERT_MODE" == "selfsigned" ]]; then
+        link="${link}&insecure=1"
+    fi
+    link="${link}#${NODE_NAME}"
 
     printf '\n%s================= cgg-vless AnyTLS 节点 =================%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : AnyTLS + TLS（sing-box）\n'
@@ -480,6 +519,9 @@ print_result() {
     printf '  - 客户端需支持 AnyTLS：sing-box 系客户端直接支持；v2rayN 需切换到 sing-box 内核\n'
     printf '  - AnyTLS 为原始 TCP + TLS，无法套 Cloudflare CDN，需客户端直连\n'
     printf '  - NAT 机器需在服务商面板把外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
+    if [[ "$CERT_MODE" == "selfsigned" ]]; then
+        printf '  - 当前为自签证书，客户端必须开启「跳过证书验证 / allowInsecure」\n'
+    fi
 }
 
 # ------------------------------ 主流程 ----------------------------------------
