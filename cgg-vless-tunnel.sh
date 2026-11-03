@@ -6,6 +6,7 @@
 # 说    明：Xray 仅在 127.0.0.1 监听 WS 明文（security: none），
 #           TLS 由 Cloudflare 边缘承担；无需域名证书，无需放行入站端口。
 #   固定隧道：网页创建隧道取 Token → cloudflared service install，域名固定
+#   固定隧道复用：沿用本机已有 cloudflared 服务，不重装、不清理
 #   临时隧道：quick tunnel（trycloudflare.com），域名随机且每次重启都会变化
 # ==============================================================================
 set -euo pipefail
@@ -26,6 +27,7 @@ readonly LOG_DIR="/var/log/xray"
 readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly CFDD_BIN="/usr/local/bin/cloudflared"
 readonly CFDD_URL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
+readonly CFDD_CONFIG_FILE="/etc/cloudflared/config.yml"
 readonly QUICK_SERVICE="cgg-quick-tunnel"
 readonly DEFAULT_LOCAL_PORT="8001"
 readonly DEFAULT_NODE_NAME="cgg-vless-tunnel"
@@ -55,6 +57,8 @@ WS_PATH=""
 NODE_NAME="${DEFAULT_NODE_NAME}"
 TUNNEL_DOMAIN=""
 CF_TOKEN="${CF_TUNNEL_TOKEN:-}"
+# 固定隧道子模式：0=新建独立隧道，1=复用本机已有隧道
+TUNNEL_REUSE="0"
 SERVER_IP=""
 RUN_USER="nobody"
 RUN_GROUP="nogroup"
@@ -152,10 +156,12 @@ validate_domain() {
 }
 
 ask_tunnel_type() {
+    local choice fixed_choice
     # 环境变量 CF_TUNNEL_TOKEN 存在时自动使用固定隧道，便于无人值守安装
     if [[ -n "$CF_TOKEN" ]]; then
         TUNNEL_TYPE="fixed"
-        log "检测到环境变量 CF_TUNNEL_TOKEN，使用固定隧道模式"
+        TUNNEL_REUSE="0"
+        log "检测到环境变量 CF_TUNNEL_TOKEN，使用固定隧道模式（新建独立隧道）"
         return 0
     fi
     if [[ ! -t 0 ]]; then
@@ -165,14 +171,35 @@ ask_tunnel_type() {
     printf '\n选择隧道类型：\n'
     printf '  1) 固定隧道（域名固定，需域名 NS 托管在 Cloudflare）\n'
     printf '  2) 临时隧道（无需账号域名，域名随机且每次重启都会变化，仅测试用）\n'
-    local choice
-    read -r -p "请选择 [1-2]（回车默认 1）：" choice
+    read -r -p "请选择 [1-2]（回车默认 1）：" choice || true
     case "${choice:-1}" in
         1) TUNNEL_TYPE="fixed" ;;
         2) TUNNEL_TYPE="quick" ;;
         *) warn "无效选项，使用固定隧道"; TUNNEL_TYPE="fixed" ;;
     esac
-    log "隧道类型：${TUNNEL_TYPE}"
+
+    TUNNEL_REUSE="0"
+    if [[ "$TUNNEL_TYPE" == "fixed" ]]; then
+        printf '\n固定隧道模式：\n'
+        printf '  1) 新建独立隧道（网页创建后粘贴 Token，回车默认）\n'
+        printf '  2) 复用本机已有隧道（沿用现有 cloudflared 服务与配置，不重装不清理）\n'
+        read -r -p "请选择 [1-2]（回车默认 1）：" fixed_choice || true
+        case "${fixed_choice:-1}" in
+            1) TUNNEL_REUSE="0" ;;
+            2) TUNNEL_REUSE="1" ;;
+            *) warn "无效选项，使用新建独立隧道"; TUNNEL_REUSE="0" ;;
+        esac
+    fi
+
+    if [[ "$TUNNEL_TYPE" == "fixed" ]]; then
+        if [[ "$TUNNEL_REUSE" == "1" ]]; then
+            log "隧道类型：固定隧道（复用已有隧道）"
+        else
+            log "隧道类型：固定隧道（新建独立隧道）"
+        fi
+    else
+        log "隧道类型：临时隧道"
+    fi
 }
 
 ask_node_name() {
@@ -477,6 +504,7 @@ save_info() {
     {
         printf 'MODE=tunnel\n'
         printf 'TUNNEL_TYPE=%s\n' "$TUNNEL_TYPE"
+        printf 'TUNNEL_REUSE=%s\n' "$TUNNEL_REUSE"
         printf 'LOCAL_PORT=%s\n' "$LOCAL_PORT"
         printf 'UUID=%s\n' "$UUID"
         printf 'WS_PATH=%s\n' "$WS_PATH"
@@ -567,7 +595,66 @@ cleanup_tunnel_services() {
 }
 
 # ------------------------------ 固定隧道 --------------------------------------
+# 复用本机已有隧道：不重装、不清理现有 cloudflared 服务，只校验回源是否指向本机端口
+setup_fixed_tunnel_reuse() {
+    local svc="" svc_found=0 input
+
+    printf '\n%s-------- 复用已有隧道检查 --------%s\n' "$C_CYAN" "$C_RESET"
+
+    [[ -x "$CFDD_BIN" ]] || die "未找到 cloudflared：${CFDD_BIN}，无法复用已有隧道"
+
+    for svc in cloudflared cloudflared-update; do
+        if systemctl cat "$svc" >/dev/null 2>&1 || [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+            svc_found=1
+            break
+        fi
+    done
+    if (( svc_found == 0 )); then
+        die "未检测到已有的 cloudflared 服务，无法复用；请改选“新建独立隧道”"
+    fi
+
+    if systemctl is-active --quiet "$svc"; then
+        log "已有隧道服务运行中：${svc}（未做任何改动）"
+    else
+        warn "已有隧道服务 ${svc} 未运行，请确认：systemctl status ${svc}"
+    fi
+
+    if [[ -f "$CFDD_CONFIG_FILE" ]]; then
+        if grep -q "http://localhost:${LOCAL_PORT}" "$CFDD_CONFIG_FILE" 2>/dev/null \
+            || grep -q "http://127.0.0.1:${LOCAL_PORT}" "$CFDD_CONFIG_FILE" 2>/dev/null; then
+            log "现有配置已包含回源：http://localhost:${LOCAL_PORT}"
+        else
+            warn "现有配置 ${CFDD_CONFIG_FILE} 未指向本机端口 ${LOCAL_PORT}"
+            printf '%s请在该文件的 ingress 中补一条（放在 http_status:404 之前）：%s\n' "$C_YELLOW" "$C_RESET"
+            printf '  - hostname: 你的域名\n'
+            printf '    service: http://localhost:%s\n' "$LOCAL_PORT"
+            printf '%s修改后执行 systemctl restart %s。%s\n' "$C_YELLOW" "$svc" "$C_RESET"
+        fi
+    else
+        warn "未找到 ${CFDD_CONFIG_FILE}（Token 托管的隧道在网页端配置回源）"
+        printf '%s请在 Cloudflare 控制台 → 该隧道 → Public Hostname 中确认：%s\n' "$C_YELLOW" "$C_RESET"
+        printf '    Type : HTTP\n'
+        printf '    URL  : http://localhost:%s\n' "$LOCAL_PORT"
+    fi
+
+    if [[ -t 0 ]]; then
+        read -r -p "请输入该隧道已配置的域名（如 ws.example.com，回车可跳过）：" input || return 0
+        input="${input//[[:space:]]/}"
+        if [[ -n "$input" ]]; then
+            validate_domain "$input" || die "域名格式不合法：${input}"
+            TUNNEL_DOMAIN="$input"
+            save_info
+        fi
+    fi
+}
+
 setup_fixed_tunnel() {
+    # 复用模式走独立分支，避免清理并覆盖本机已有的 cloudflared 服务
+    if [[ "$TUNNEL_REUSE" == "1" ]]; then
+        setup_fixed_tunnel_reuse
+        return 0
+    fi
+
     printf '\n%s-------- 固定隧道配置提示 --------%s\n' "$C_CYAN" "$C_RESET"
     printf '  1) 登录 Cloudflare 控制台 → Zero Trust → Networks → Tunnels\n'
     printf '  2) Create a tunnel → 类型选 Cloudflared → 填写隧道名\n'
@@ -671,11 +758,19 @@ EOF
 
 # ------------------------------ 结果输出 --------------------------------------
 print_result() {
-    local link enc_path
+    local link enc_path tunnel_label
 
     if [[ -z "$TUNNEL_DOMAIN" ]]; then
         warn "尚未记录隧道域名，链接中域名为占位符，配置好后请在总菜单 6 中重新查看"
         TUNNEL_DOMAIN="YOUR_TUNNEL_DOMAIN"
+    fi
+
+    if [[ "$TUNNEL_TYPE" == "quick" ]]; then
+        tunnel_label="临时隧道（trycloudflare）"
+    elif [[ "$TUNNEL_REUSE" == "1" ]]; then
+        tunnel_label="固定隧道（复用已有隧道）"
+    else
+        tunnel_label="固定隧道（新建独立隧道）"
     fi
 
     enc_path="$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')"
@@ -683,7 +778,7 @@ print_result() {
 
     printf '\n%s============ cgg-vless WS + CF Tunnel 节点信息 ============%s\n' "$C_CYAN" "$C_RESET"
     printf '  节点名称    : %s\n' "$NODE_NAME"
-    printf '  隧道类型    : %s\n' "$([[ "$TUNNEL_TYPE" == "quick" ]] && printf '临时隧道（trycloudflare）' || printf '固定隧道')"
+    printf '  隧道类型    : %s\n' "$tunnel_label"
     printf '  隧道域名    : %s\n' "$TUNNEL_DOMAIN"
     printf '  客户端端口  : 443（TLS 由 Cloudflare 边缘处理）\n'
     printf '  UUID        : %s\n' "$UUID"
@@ -715,6 +810,8 @@ print_result() {
     printf '%s服务管理：systemctl {status|restart|stop} xray%s\n' "$C_CYAN" "$C_RESET"
     if [[ "$TUNNEL_TYPE" == "quick" ]]; then
         printf '%s隧道服务：%s（日志：journalctl -u %s -n 50）%s\n\n' "$C_CYAN" "$QUICK_SERVICE" "$QUICK_SERVICE" "$C_RESET"
+    elif [[ "$TUNNEL_REUSE" == "1" ]]; then
+        printf '%s隧道服务：systemctl status cloudflared（复用模式，脚本未改动该服务）%s\n\n' "$C_CYAN" "$C_RESET"
     else
         printf '%s隧道服务：systemctl status cloudflared%s\n\n' "$C_CYAN" "$C_RESET"
     fi
