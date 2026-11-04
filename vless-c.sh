@@ -2128,6 +2128,307 @@ release_ports() {
     return 0
 }
 
+# ------------------------------ 核心更新 --------------------------------------
+# 读取 Xray 版本描述（未安装时显示“未安装”）
+xray_version_desc() {
+    local out
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        printf '未安装'
+        return 0
+    fi
+    out="$("$XRAY_BIN" version 2>/dev/null | head -n 1 || true)"
+    printf '%s' "${out:-未知}"
+}
+
+# 读取 sing-box 版本描述（未安装时显示“未安装”）
+singbox_version_desc() {
+    local out
+    if [[ ! -x "$SINGBOX_BIN" ]]; then
+        printf '未安装'
+        return 0
+    fi
+    out="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 || true)"
+    printf '%s' "${out:-未知}"
+}
+
+# 更新 Xray 核心：官方脚本安装最新版，保留自定义 systemd 服务文件
+update_xray_core() {
+    local url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+    local tmp ans old_ver new_ver svc_backup="" xray_bak=""
+
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        err "未检测到 Xray（${XRAY_BIN}），请先安装节点"
+        return 1
+    fi
+    command -v curl >/dev/null 2>&1 || { err "缺少 curl，无法下载更新脚本"; return 1; }
+
+    old_ver="$("$XRAY_BIN" version 2>/dev/null | head -n 1 || true)"
+    warn "即将通过官方脚本更新 Xray 核心，更新过程中服务会短暂中断"
+    warn "现有配置文件不会被删除，更新后会校验配置，校验失败自动回滚旧版二进制"
+    if ! read -r -p "确认更新 Xray？[y/N]：" ans; then
+        printf '\n'
+        warn "已取消"
+        return 1
+    fi
+    case "$ans" in
+        [Yy]*) ;;
+        *) warn "已取消"; return 1 ;;
+    esac
+
+    # 备份旧版二进制，配置校验或启动失败时回滚
+    xray_bak="${XRAY_BIN}.cgg-bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -a "$XRAY_BIN" "$xray_bak"; then
+        err "备份旧版 Xray 失败，已中止"
+        return 1
+    fi
+
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cgg-xray-install-XXXXXX.sh")" \
+        || { rm -f "$xray_bak"; err "创建临时文件失败"; return 1; }
+    log "下载 Xray 官方安装脚本..."
+    if ! curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$tmp"; then
+        rm -f "$tmp" "$xray_bak"
+        err "下载安装脚本失败，请检查网络后重试"
+        return 1
+    fi
+
+    # 备份自定义服务文件，避免官方脚本覆盖运行用户等设置
+    if [[ -f "$SERVICE_FILE" ]]; then
+        svc_backup="$(mktemp "${TMPDIR:-/tmp}/cgg-xray-service-XXXXXX")" \
+            || { rm -f "$tmp" "$xray_bak"; err "创建服务备份临时文件失败"; return 1; }
+        if ! cp -a "$SERVICE_FILE" "$svc_backup"; then
+            rm -f "$tmp" "$svc_backup" "$xray_bak"
+            err "备份 Xray 服务文件失败，已中止"
+            return 1
+        fi
+    fi
+
+    log "执行官方安装脚本（安装最新版）..."
+    if ! bash "$tmp"; then
+        rm -f "$tmp"
+        if [[ -n "$svc_backup" && -f "$svc_backup" ]]; then
+            install -m 644 -o root -g root "$svc_backup" "$SERVICE_FILE" 2>/dev/null \
+                || warn "恢复 Xray 服务文件失败，备份位于 ${svc_backup}"
+            rm -f "$svc_backup"
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # 二进制未被替换时删除备份，被改动过则保留以便手动恢复
+        if cmp -s "$XRAY_BIN" "$xray_bak" 2>/dev/null; then
+            rm -f "$xray_bak"
+            err "官方安装脚本执行失败，Xray 未更新"
+        else
+            err "官方安装脚本执行失败，旧版备份位于 ${xray_bak}，请手动确认"
+        fi
+        return 1
+    fi
+    rm -f "$tmp"
+
+    # 恢复自定义服务文件并重新加载
+    if [[ -n "$svc_backup" && -f "$svc_backup" ]]; then
+        if ! install -m 644 -o root -g root "$svc_backup" "$SERVICE_FILE"; then
+            warn "恢复 Xray 服务文件失败，备份位于 ${svc_backup}"
+        fi
+        rm -f "$svc_backup"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # 配置校验不通过时回滚旧版二进制，避免节点变为不可用
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if ! "$XRAY_BIN" run -test -config "$CONFIG_FILE" >/dev/null 2>&1; then
+            warn "新版本 Xray 配置校验失败，正在回滚旧版二进制..."
+            if ! install -m 755 -o root -g root "$xray_bak" "$XRAY_BIN"; then
+                err "回滚失败，旧版备份位于 ${xray_bak}，请手动恢复"
+                return 1
+            fi
+            rm -f "$xray_bak"
+            if systemctl cat xray >/dev/null 2>&1; then
+                systemctl restart xray >/dev/null 2>&1 || warn "回滚后重启 Xray 失败"
+            fi
+            err "已回滚到旧版 Xray，请检查配置后再更新"
+            return 1
+        fi
+    fi
+
+    if systemctl cat xray >/dev/null 2>&1; then
+        if ! systemctl restart xray || ! systemctl is-active --quiet xray; then
+            warn "新版本 Xray 启动失败，正在回滚旧版二进制..."
+            if install -m 755 -o root -g root "$xray_bak" "$XRAY_BIN"; then
+                if systemctl restart xray >/dev/null 2>&1; then
+                    rm -f "$xray_bak"
+                    err "已回滚到旧版 Xray，请执行 journalctl -u xray 查看失败原因"
+                else
+                    err "已恢复旧版二进制，但服务仍未启动，请执行 journalctl -u xray 查看日志；备份：${xray_bak}"
+                fi
+            else
+                err "回滚失败，旧版备份位于 ${xray_bak}，请手动恢复"
+            fi
+            return 1
+        fi
+    fi
+
+    rm -f "$xray_bak"
+    new_ver="$("$XRAY_BIN" version 2>/dev/null | head -n 1 || true)"
+    log "Xray 核心更新完成"
+    printf '  更新前：%s\n  更新后：%s\n' "${old_ver:-未知}" "${new_ver:-未知}"
+    return 0
+}
+
+# 更新 sing-box 核心：新二进制校验现有配置通过后才替换，启动失败自动回滚
+update_singbox_core() {
+    local tag ver arch tmpdir new_bin bak ans old_ver new_ver cfg svc failed=0
+
+    if [[ ! -x "$SINGBOX_BIN" ]]; then
+        err "未检测到 sing-box（${SINGBOX_BIN}），请先安装 AnyTLS 或 Hysteria 2 节点"
+        return 1
+    fi
+    command -v curl >/dev/null 2>&1 || { err "缺少 curl，无法下载新版本"; return 1; }
+    command -v tar >/dev/null 2>&1 || { err "缺少 tar，无法解压新版本"; return 1; }
+
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) err "当前架构不支持自动更新 sing-box"; return 1 ;;
+    esac
+
+    old_ver="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 || true)"
+    warn "即将更新 sing-box 核心，AnyTLS / Hysteria 2 服务会短暂中断"
+    warn "新版本会先校验现有配置，校验通过才替换，启动失败会自动回滚"
+    if ! read -r -p "确认更新 sing-box？[y/N]：" ans; then
+        printf '\n'
+        warn "已取消"
+        return 1
+    fi
+    case "$ans" in
+        [Yy]*) ;;
+        *) warn "已取消"; return 1 ;;
+    esac
+
+    log "获取 sing-box 最新版本..."
+    tag="$(curl -fsSL --retry 3 --connect-timeout 15 \
+        "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+    if [[ -z "$tag" ]]; then
+        err "获取 sing-box 最新版本失败（GitHub API 不可达或触发限流）"
+        return 1
+    fi
+
+    ver="${tag#v}"
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/cgg-singbox-XXXXXX")" \
+        || { err "创建临时目录失败"; return 1; }
+
+    log "下载 sing-box ${tag}（linux-${arch}）..."
+    if ! curl -fsSL --retry 3 --connect-timeout 15 \
+        "https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${ver}-linux-${arch}.tar.gz" \
+        -o "${tmpdir}/sing-box.tar.gz"; then
+        rm -rf "$tmpdir"
+        err "下载 sing-box 失败，请检查网络后重试"
+        return 1
+    fi
+
+    if ! tar -xzf "${tmpdir}/sing-box.tar.gz" -C "$tmpdir"; then
+        rm -rf "$tmpdir"
+        err "解压 sing-box 失败，已放弃更新"
+        return 1
+    fi
+
+    new_bin="${tmpdir}/sing-box-${ver}-linux-${arch}/sing-box"
+    if [[ ! -x "$new_bin" ]]; then
+        new_bin="$(find "$tmpdir" -type f -name sing-box 2>/dev/null | head -n 1 || true)"
+    fi
+    if [[ -z "$new_bin" || ! -x "$new_bin" ]]; then
+        rm -rf "$tmpdir"
+        err "压缩包中未找到可执行的 sing-box"
+        return 1
+    fi
+
+    # 用新二进制校验现有配置，避免更新后服务无法启动
+    for cfg in "$ANYTLS_CONFIG" "$HS2_CONFIG"; do
+        [[ -f "$cfg" ]] || continue
+        if ! "$new_bin" check -c "$cfg" >/dev/null 2>&1; then
+            rm -rf "$tmpdir"
+            err "新版本 sing-box 无法通过配置校验：${cfg}，已放弃更新"
+            return 1
+        fi
+    done
+
+    bak="${SINGBOX_BIN}.cgg-bak.$(date +%Y%m%d%H%M%S)"
+    if ! cp -a "$SINGBOX_BIN" "$bak"; then
+        rm -rf "$tmpdir"
+        err "备份旧版 sing-box 失败，已中止"
+        return 1
+    fi
+    if ! install -m 755 -o root -g root "$new_bin" "$SINGBOX_BIN"; then
+        rm -rf "$tmpdir"
+        err "替换 sing-box 失败，旧版备份位于 ${bak}"
+        return 1
+    fi
+    rm -rf "$tmpdir"
+
+    for svc in cgg-anytls cgg-hysteria2; do
+        if systemctl cat "$svc" >/dev/null 2>&1; then
+            if ! systemctl restart "$svc"; then
+                warn "服务 ${svc} 重启失败"
+                failed=1
+                break
+            fi
+            if ! systemctl is-active --quiet "$svc"; then
+                warn "服务 ${svc} 未处于运行状态"
+                failed=1
+                break
+            fi
+        fi
+    done
+
+    if (( failed == 1 )); then
+        warn "sing-box 新版本启动失败，正在回滚旧版本..."
+        if ! install -m 755 -o root -g root "$bak" "$SINGBOX_BIN"; then
+            err "回滚失败，旧版备份位于 ${bak}，请手动恢复"
+            return 1
+        fi
+        for svc in cgg-anytls cgg-hysteria2; do
+            if systemctl cat "$svc" >/dev/null 2>&1; then
+                systemctl restart "$svc" >/dev/null 2>&1 || warn "回滚后重启 ${svc} 失败"
+            fi
+        done
+        rm -f "$bak"
+        err "已回滚到旧版 sing-box，请执行 journalctl -u cgg-anytls / journalctl -u cgg-hysteria2 查看失败原因"
+        return 1
+    fi
+
+    # 更新成功，删除备份避免占用小硬盘空间
+    rm -f "$bak"
+    new_ver="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 || true)"
+    log "sing-box 核心更新完成"
+    printf '  更新前：%s\n  更新后：%s\n' "${old_ver:-未知}" "${new_ver:-未知}"
+    return 0
+}
+
+# 核心更新子菜单
+core_update_menu() {
+    local choice
+    while true; do
+        printf '\n%s-------- 核心更新 --------%s\n' "$C_CYAN" "$C_RESET"
+        printf '  当前 Xray     ：%s\n' "$(xray_version_desc)"
+        printf '  当前 sing-box ：%s\n' "$(singbox_version_desc)"
+        printf '  1) 更新 Xray 核心（官方脚本，保留现有配置与服务文件）\n'
+        printf '  2) 更新 sing-box 核心（更新前校验配置，失败自动回滚）\n'
+        printf '  0) 返回主菜单\n'
+        printf '%s--------------------------%s\n' "$C_CYAN" "$C_RESET"
+
+        if ! read -r -p "请选择 [0-2]：" choice; then
+            printf '\n'
+            return 0
+        fi
+        case "$choice" in
+            1) update_xray_core || true ;;
+            2) update_singbox_core || true ;;
+            0) return 0 ;;
+            *) warn "无效选项：${choice}" ;;
+        esac
+        printf '\n'
+    done
+}
+
 # ------------------------------ TCP 窗口调优 ----------------------------------
 readonly NETOPT_CONF="/etc/sysctl.d/99-cgg-vless-tcp.conf"
 
@@ -2301,6 +2602,7 @@ show_menu() {
     printf '  14) TCP 窗口调优（无需内核支持）\n'
     printf '  15) 开启 BBR 加速（需内核支持）\n'
     printf '  16) 端口释放（停止节点服务并清理端口防火墙规则）\n'
+    printf '  17) 核心更新（Xray / sing-box）\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -2315,7 +2617,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-16]：" choice; then
+        if ! read -r -p "请选择 [0-17]：" choice; then
             printf '\n'
             return 0
         fi
@@ -2336,6 +2638,7 @@ main_menu() {
             14) enable_tcp_tune || true ;;
             15) enable_bbr || true ;;
             16) release_ports || true ;;
+            17) core_update_menu || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
