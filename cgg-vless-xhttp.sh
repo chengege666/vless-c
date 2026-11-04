@@ -653,7 +653,7 @@ write_config() {
 
     local listen_addr="0.0.0.0"
     local listen_port="$LISTEN_PORT"
-    local tls_block=$'\n        "tlsSettings": {\n          "alpn": [\n            "h2",\n            "http/1.1"\n          ],\n          "certificates": [\n            {\n              "certificateFile": "'"$CERT_DIR"'/fullchain.pem",\n              "keyFile": "'"$CERT_DIR"'/privkey.pem"\n            }\n          ]\n        },'
+    local tls_block=$'\n        "tlsSettings": {\n          "alpn": [\n            "h2",\n            "http/1.1"\n          ],\n          "certificates": [\n            {\n              "certificateFile": "'"$CERT_DIR"$'/fullchain.pem",\n              "keyFile": "'"$CERT_DIR"$'/privkey.pem"\n            }\n          ]\n        },'
 
     cat > "$new_cfg" <<EOF
 {
