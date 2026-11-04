@@ -911,7 +911,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${CFDD_BIN} tunnel --no-autoupdate --url http://127.0.0.1:${LOCAL_PORT}
+ExecStart=${CFDD_BIN} tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:${LOCAL_PORT}
 Restart=on-failure
 RestartSec=5
 
