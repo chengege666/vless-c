@@ -630,7 +630,7 @@ show_info_ws() {
 
 # XHTTP 模式（VLESS + XHTTP + TLS）节点信息
 show_info_xhttp() {
-    local port uuid path domain link ip enc_path node_name mode
+    local port uuid path domain link ip enc_path node_name mode deploy ttype latest
     if ! inbound_exists "$TAG_XHTTP"; then
         err "未找到 XHTTP+TLS 节点配置"
         return 1
@@ -646,6 +646,43 @@ show_info_xhttp() {
         return 1
     fi
 
+    deploy="$(read_node_value "$TAG_XHTTP" DEPLOY_MODE || true)"
+    [[ -n "$deploy" ]] || deploy="cdn"
+    node_name="$(read_node_value "$TAG_XHTTP" NODE_NAME || true)"
+    [[ -n "$node_name" ]] || node_name="cgg-vless-xhttp"
+    enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
+
+    if [[ "$deploy" == "tunnel" ]]; then
+        ttype="$(read_node_value "$TAG_XHTTP" TUNNEL_TYPE || true)"
+        domain="$(read_node_value "$TAG_XHTTP" TUNNEL_DOMAIN || true)"
+        # 临时隧道重启后域名会变化，优先读取服务日志中的最新域名
+        if [[ "$ttype" == "quick" ]]; then
+            latest="$(journalctl -u cgg-quick-tunnel-xhttp --no-pager -n 200 2>/dev/null \
+                | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
+            if [[ -n "$latest" && "${latest#https://}" != "$domain" ]]; then
+                domain="${latest#https://}"
+                write_node_value "$TAG_XHTTP" TUNNEL_DOMAIN "$domain" 2>/dev/null || true
+            fi
+        fi
+        [[ -n "$domain" ]] || domain="YOUR_TUNNEL_DOMAIN"
+        link="vless://${uuid}@${domain}:443?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}&alpn=h2#${node_name}"
+
+        printf '\n%s============ cgg-vless XHTTP + CF Tunnel 节点 ============%s\n' "$C_CYAN" "$C_RESET"
+        printf '  模式        : VLESS + XHTTP + Cloudflare Tunnel\n'
+        printf '  节点名称    : %s\n' "$node_name"
+        printf '  隧道域名    : %s\n' "$domain"
+        printf '  客户端端口  : 443（TLS 由 Cloudflare 边缘处理）\n'
+        printf '  本地回源    : 127.0.0.1:%s\n' "$port"
+        printf '  UUID        : %s\n' "$uuid"
+        printf '  XHTTP 路径  : %s\n' "$path"
+        printf '  XHTTP 模式  : %s\n' "$mode"
+        printf '  SNI         : %s\n' "$domain"
+        printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
+        printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
+        return 0
+    fi
+
+    # CDN / 直连模式
     # 优先使用安装时记录的域名，避免证书为泛域名时无法作为 SNI
     domain="$(read_node_value "$TAG_XHTTP" DOMAIN || true)"
     if [[ -z "$domain" ]]; then
@@ -657,9 +694,6 @@ show_info_xhttp() {
     fi
 
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
-    node_name="$(read_node_value "$TAG_XHTTP" NODE_NAME || true)"
-    [[ -n "$node_name" ]] || node_name="cgg-vless-xhttp"
     link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}&alpn=h2#${node_name}"
 
     printf '\n%s============ cgg-vless XHTTP + TLS 节点 ============%s\n' "$C_CYAN" "$C_RESET"
@@ -930,10 +964,19 @@ service_action() {
 
     sleep 1
 
-    # Cloudflare Tunnel 服务仅在存在 Tunnel 节点时联动（固定：cloudflared；临时：cgg-quick-tunnel）
-    if (( has_xray == 1 )) && inbound_exists "$TAG_TUNNEL"; then
+    # Cloudflare Tunnel 服务仅在存在 Tunnel 节点时联动
+    # 固定：cloudflared；临时：cgg-quick-tunnel（WS）/ cgg-quick-tunnel-xhttp（XHTTP）
+    local has_tunnel=0
+    if inbound_exists "$TAG_TUNNEL"; then
+        has_tunnel=1
+    elif inbound_exists "$TAG_XHTTP"; then
+        local xdeploy
+        xdeploy="$(read_node_value "$TAG_XHTTP" DEPLOY_MODE 2>/dev/null || true)"
+        [[ "$xdeploy" == "tunnel" ]] && has_tunnel=1
+    fi
+    if (( has_xray == 1 )) && (( has_tunnel == 1 )); then
         local tsvc
-        for tsvc in cloudflared cgg-quick-tunnel; do
+        for tsvc in cloudflared cgg-quick-tunnel cgg-quick-tunnel-xhttp; do
             if systemctl cat "$tsvc" >/dev/null 2>&1; then
                 systemctl "$action" "$tsvc" >/dev/null 2>&1 || warn "systemctl ${action} ${tsvc} 失败"
             fi
@@ -1675,7 +1718,7 @@ uninstall_node_choices() {
 # 删除 CF Tunnel 相关服务（固定与临时一并清理，保留 cloudflared 主程序）
 remove_tunnel_service() {
     local ans svc
-    local list=("cloudflared" "cloudflared-update" "cgg-quick-tunnel")
+    local list=("cloudflared" "cloudflared-update" "cgg-quick-tunnel" "cgg-quick-tunnel-xhttp")
     local found=0 removed=0
 
     for svc in "${list[@]}"; do
@@ -1769,6 +1812,19 @@ remove_xray_node() {
     # CF Tunnel 节点需同时清理隧道服务
     if [[ "$tag" == "$TAG_TUNNEL" ]]; then
         remove_tunnel_service
+    elif [[ "$tag" == "$TAG_XHTTP" ]]; then
+        local xdeploy
+        xdeploy="$(read_node_value "$TAG_XHTTP" DEPLOY_MODE 2>/dev/null || true)"
+        if [[ "$xdeploy" == "tunnel" ]]; then
+            # 仅清理 XHTTP 自己的临时隧道服务，不动 cloudflared 主服务（可能被 WS Tunnel 复用）
+            if systemctl cat cgg-quick-tunnel-xhttp >/dev/null 2>&1 || [[ -f "/etc/systemd/system/cgg-quick-tunnel-xhttp.service" ]]; then
+                systemctl stop cgg-quick-tunnel-xhttp >/dev/null 2>&1 || true
+                systemctl disable cgg-quick-tunnel-xhttp >/dev/null 2>&1 || true
+                rm -f "/etc/systemd/system/cgg-quick-tunnel-xhttp.service"
+                systemctl daemon-reload >/dev/null 2>&1 || true
+                log "已删除 XHTTP 临时隧道服务：cgg-quick-tunnel-xhttp"
+            fi
+        fi
     fi
 
     remaining="$(xray_node_tags || true)"
@@ -1908,9 +1964,9 @@ uninstall_all() {
     systemctl daemon-reload
     systemctl reset-failed >/dev/null 2>&1 || true
 
-    # 清理 Cloudflare Tunnel 服务（固定：cloudflared；临时：cgg-quick-tunnel）
+    # 清理 Cloudflare Tunnel 服务（固定：cloudflared；临时：cgg-quick-tunnel / cgg-quick-tunnel-xhttp）
     local tsvc tremoved=""
-    for tsvc in cloudflared cgg-quick-tunnel; do
+    for tsvc in cloudflared cgg-quick-tunnel cgg-quick-tunnel-xhttp; do
         if systemctl cat "$tsvc" >/dev/null 2>&1; then
             systemctl stop "$tsvc" >/dev/null 2>&1 || true
             systemctl disable "$tsvc" >/dev/null 2>&1 || true
