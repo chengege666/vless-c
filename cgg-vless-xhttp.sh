@@ -1157,9 +1157,11 @@ get_public_ip() {
 
 # ------------------------------ 结果输出 --------------------------------------
 print_result() {
-    local link ip enc_path tunnel_label
+    local link ip enc_path tunnel_label xhttp_mode
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
     enc_path="$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')"
+    xhttp_mode="auto"
+    [[ "$DEPLOY_MODE" == "tunnel" ]] && xhttp_mode="packet-up"
 
     if command -v jq >/dev/null 2>&1 && [[ -f "$CONFIG_FILE" ]]; then
         if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -1191,7 +1193,7 @@ print_result() {
         printf '  UUID        : %s\n' "$UUID"
         printf '  传输协议    : xhttp\n'
         printf '  XHTTP 路径  : %s\n' "$WS_PATH"
-        printf '  XHTTP 模式  : packet-up\n'
+        printf '  XHTTP 模式  : %s\n' "$xhttp_mode"
         printf '  本地回源    : 127.0.0.1:%s\n' "$LOCAL_PORT"
         printf '  SNI         : %s\n' "$TUNNEL_DOMAIN"
         printf '%s============================================================%s\n\n' "$C_CYAN" "$C_RESET"
@@ -1227,7 +1229,7 @@ print_result() {
     printf '  UUID        : %s\n' "$UUID"
     printf '  传输协议    : xhttp\n'
     printf '  XHTTP 路径  : %s\n' "$WS_PATH"
-    printf '  XHTTP 模式  : auto\n'
+    printf '  XHTTP 模式  : %s\n' "$xhttp_mode"
     printf '  安全类型    : tls\n'
     printf '  SNI         : %s\n' "$DOMAIN"
     printf '  证书路径    : %s\n' "$CERT_DIR"
