@@ -1906,6 +1906,167 @@ uninstall_all() {
     log "卸载完成（防火墙放行规则未自动删除，如有需要请手动清理）"
 }
 
+# ------------------------------ 端口释放 --------------------------------------
+# 收集本脚本记录的端口，输出格式：协议|端口|来源|类型（main=监听端口，hop=端口跳跃）
+collect_script_ports() {
+    local t port hop item
+    while IFS= read -r t; do
+        [[ -n "$t" ]] || continue
+        port="$(read_node_value "$t" PORT 2>/dev/null || true)"
+        if [[ -z "$port" ]]; then
+            # CF Tunnel 模式元信息使用 LOCAL_PORT
+            port="$(read_node_value "$t" LOCAL_PORT 2>/dev/null || true)"
+        fi
+        [[ -n "$port" ]] || port="$(inbound_get "$t" '.port' 2>/dev/null || true)"
+        if [[ -n "$port" ]]; then
+            printf 'tcp|%s|%s|main\n' "$port" "$(tag_desc "$t")"
+        fi
+    done < <(xray_node_tags)
+
+    if [[ -f "$ANYTLS_CONFIG" ]]; then
+        port="$(read_anytls_info PORT 2>/dev/null || true)"
+        [[ -n "$port" ]] || port="$(jq -r '.inbounds[0].listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null || true)"
+        if [[ -n "$port" ]]; then
+            printf 'tcp|%s|AnyTLS|main\n' "$port"
+        fi
+    fi
+
+    if [[ -f "$HS2_CONFIG" ]]; then
+        port="$(read_hysteria2_info PORT 2>/dev/null || true)"
+        [[ -n "$port" ]] || port="$(jq -r '.inbounds[0].listen_port // empty' "$HS2_CONFIG" 2>/dev/null || true)"
+        if [[ -n "$port" ]]; then
+            printf 'udp|%s|Hysteria 2|main\n' "$port"
+        fi
+        hop="$(read_hysteria2_info HOP 2>/dev/null || true)"
+        if [[ -n "$hop" ]]; then
+            local -a hop_items=()
+            IFS=',' read -r -a hop_items <<< "$hop"
+            for item in "${hop_items[@]}"; do
+                [[ -n "$item" ]] || continue
+                printf 'udp|%s|Hysteria 2 端口跳跃|hop\n' "$item"
+            done
+        fi
+    fi
+}
+
+# 判断端口当前是否仍被监听
+port_still_in_use() {
+    local proto="$1" port="$2"
+    command -v ss >/dev/null 2>&1 || return 1
+    if [[ "$proto" == "udp" ]]; then
+        ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+    else
+        ss -H -lnt "sport = :${port}" 2>/dev/null | grep -q .
+    fi
+}
+
+# 输出端口占用进程信息（未占用时输出“未占用”）
+port_holder_desc() {
+    local proto="$1" port="$2" out
+    command -v ss >/dev/null 2>&1 || { printf '未知（缺少 ss 命令）'; return 0; }
+    if [[ "$proto" == "udp" ]]; then
+        out="$(ss -H -lunp "sport = :${port}" 2>/dev/null | head -n 1 || true)"
+    else
+        out="$(ss -H -lntp "sport = :${port}" 2>/dev/null | head -n 1 || true)"
+    fi
+    if [[ -z "$out" ]]; then
+        printf '未占用'
+    else
+        printf '占用：%s' "$out"
+    fi
+}
+
+# 仅删除指定端口的放行规则，禁止全局重置防火墙
+remove_firewall_allow() {
+    local proto="$1" port="$2" i
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        # 安装脚本可能重复插入同一规则，循环删除但限制次数避免死循环
+        for i in 1 2 3; do
+            iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+            iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+        done
+    fi
+}
+
+# 端口释放：停止本脚本的节点服务并清理对应端口的防火墙放行规则，不删除配置与程序
+release_ports() {
+    local ans line proto port desc kind svc still=0
+    local -a items=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        items+=("$line")
+    done < <(collect_script_ports)
+
+    if (( ${#items[@]} == 0 )); then
+        err "未找到本脚本记录的端口（可能尚未安装节点）"
+        return 1
+    fi
+
+    printf '\n%s-------- 端口释放 --------%s\n' "$C_CYAN" "$C_RESET"
+    for line in "${items[@]}"; do
+        IFS='|' read -r proto port desc kind <<< "$line"
+        if [[ "$kind" == "hop" ]]; then
+            printf '  %-14s %-30s %s\n' "${port}/${proto}" "$desc" "端口跳跃规则（nat）"
+        else
+            printf '  %-14s %-30s %s\n' "${port}/${proto}" "$desc" "$(port_holder_desc "$proto" "$port")"
+        fi
+    done
+    printf '%s--------------------------%s\n' "$C_CYAN" "$C_RESET"
+
+    warn "该操作将停止本脚本创建的 Xray / AnyTLS / Hysteria 2 服务，并只删除上述端口的 UFW / iptables 放行规则"
+    warn "不会删除配置与程序；重启系统后服务会重新占用这些端口，如需彻底释放请使用卸载功能"
+    read -r -p "确认释放端口？[yes/N]：" ans
+    if [[ "$ans" != "yes" ]]; then
+        warn "已取消"
+        return 1
+    fi
+
+    # 端口跳跃服务需先停止，其 ExecStop 会清理 nat REDIRECT 规则
+    if systemctl cat cgg-hysteria2-hop >/dev/null 2>&1; then
+        systemctl stop cgg-hysteria2-hop >/dev/null 2>&1 || warn "停止 cgg-hysteria2-hop 失败"
+    elif [[ -f "${SINGBOX_DIR}/port-hopping.sh" ]]; then
+        bash "${SINGBOX_DIR}/port-hopping.sh" stop >/dev/null 2>&1 \
+            || warn "清理端口跳跃 nat 规则失败，请手动检查"
+    fi
+
+    for svc in xray cgg-anytls cgg-hysteria2; do
+        if systemctl cat "$svc" >/dev/null 2>&1; then
+            systemctl stop "$svc" >/dev/null 2>&1 || warn "停止服务 ${svc} 失败"
+        fi
+    done
+    sleep 1
+
+    for line in "${items[@]}"; do
+        IFS='|' read -r proto port desc kind <<< "$line"
+        [[ "$kind" == "main" ]] || continue
+        remove_firewall_allow "$proto" "$port"
+        log "已尝试清理端口 ${port}/${proto} 的防火墙放行规则（来源：${desc}）"
+    done
+
+    for line in "${items[@]}"; do
+        IFS='|' read -r proto port desc kind <<< "$line"
+        [[ "$kind" == "main" ]] || continue
+        if port_still_in_use "$proto" "$port"; then
+            warn "端口 ${port}/${proto} 仍被占用：$(port_holder_desc "$proto" "$port")"
+            still=1
+        else
+            log "端口 ${port}/${proto} 已释放（来源：${desc}）"
+        fi
+    done
+
+    warn "WS + TLS 模式额外放行的 80/tcp 未自动删除，如需清理请手动执行：ufw delete allow 80/tcp"
+    if (( still == 1 )); then
+        warn "部分端口仍被占用，可能由其他程序持有，请按上方进程信息手动处理"
+        return 1
+    fi
+    log "端口释放完成（配置与程序未删除）"
+    return 0
+}
+
 # ------------------------------ TCP 窗口调优 ----------------------------------
 readonly NETOPT_CONF="/etc/sysctl.d/99-cgg-vless-tcp.conf"
 
@@ -2078,6 +2239,7 @@ show_menu() {
     printf '  13) 一键彻底卸载\n'
     printf '  14) TCP 窗口调优（无需内核支持）\n'
     printf '  15) 开启 BBR 加速（需内核支持）\n'
+    printf '  16) 端口释放（停止节点服务并清理端口防火墙规则）\n'
     printf '  0) 退出\n'
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -2092,7 +2254,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-15]：" choice; then
+        if ! read -r -p "请选择 [0-16]：" choice; then
             printf '\n'
             return 0
         fi
@@ -2112,6 +2274,7 @@ main_menu() {
             13) uninstall_all || true ;;
             14) enable_tcp_tune || true ;;
             15) enable_bbr || true ;;
+            16) release_ports || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac
