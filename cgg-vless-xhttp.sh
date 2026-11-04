@@ -413,7 +413,7 @@ install_acme() {
     local email_arg=""
     [[ -n "$EMAIL" ]] && email_arg="email=${EMAIL}"
 
-    if ! curl -fsSL --retry 3 --connect-timeout 15 https://get.acme.sh | sh -s ${email_arg}; then
+    if ! curl -fsSL --retry 3 --connect-timeout 15 https://get.acme.sh | sh -s "${email_arg}"; then
         die "acme.sh 安装失败，请检查网络"
     fi
     [[ -x "$ACME_BIN" ]] || die "acme.sh 安装后未找到 ${ACME_BIN}"
