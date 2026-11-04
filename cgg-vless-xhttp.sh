@@ -34,7 +34,7 @@ readonly CFDD_BIN="/usr/local/bin/cloudflared"
 readonly CFDD_URL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 readonly CFDD_CONFIG_FILE="/etc/cloudflared/config.yml"
 readonly QUICK_SERVICE="cgg-quick-tunnel-xhttp"
-readonly DEFAULT_LOCAL_PORT="8081"
+readonly DEFAULT_LOCAL_PORT="8082"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
