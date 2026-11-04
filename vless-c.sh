@@ -2567,24 +2567,24 @@ show_menu() {
 
     printf '%s==================== cgg-vless 总菜单 ====================%s\n' "$C_MAGENTA" "$C_RESET"
     printf '  当前节点：%b\n' "$mode_desc"
-    printf '  1) 安装 VLESS-Reality 节点\n'
-    printf '  2) 安装 VLESS + WS + TLS 节点（CDN）\n'
-    printf '  3) 安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）\n'
-    printf '  4) 安装 AnyTLS + TLS 节点（sing-box 后端）\n'
-    printf '  5) 安装 Hysteria 2 节点（sing-box 后端）\n'
-    printf '  6) 查看当前节点配置与连接链接\n'
-    printf '  7) 启动 Xray 服务\n'
-    printf '  8) 停止 Xray 服务\n'
-    printf '  9) 重启 Xray 服务\n'
-    printf '  10) 修改配置（节点名称 / SNI / UUID）\n'
-    printf '  11) SSL 证书管理（acme.sh 申请 / 续期 / 安装）\n'
-    printf '  12) 卸载指定节点（Reality / WS / Tunnel / AnyTLS / Hysteria2）\n'
-    printf '  13) 一键彻底卸载\n'
-    printf '  14) TCP 窗口调优（无需内核支持）\n'
-    printf '  15) 开启 BBR 加速（需内核支持）\n'
-    printf '  16) 端口释放（停止节点服务并清理端口防火墙规则）\n'
-    printf '  17) 核心更新（Xray / sing-box）\n'
-    printf '  0) 退出\n'
+    printf '  %-2s %s\n' "1"  "安装 VLESS-Reality 节点"
+    printf '  %-2s %s\n' "2"  "安装 VLESS + WS + TLS 节点"
+    printf '  %-2s %s\n' "3"  "安装 VLESS + WS 隧道节点"
+    printf '  %-2s %s\n' "4"  "安装 AnyTLS 节点"
+    printf '  %-2s %s\n' "5"  "安装 Hysteria 2 节点"
+    printf '  %-2s %s\n' "6"  "查看当前节点配置与连接链接"
+    printf '  %-2s %s\n' "7"  "启动 Xray 服务"
+    printf '  %-2s %s\n' "8"  "停止 Xray 服务"
+    printf '  %-2s %s\n' "9"  "重启 Xray 服务"
+    printf '  %-2s %s\n' "10" "修改配置"
+    printf '  %-2s %s\n' "11" "SSL 证书管理"
+    printf '  %-2s %s\n' "12" "卸载指定节点"
+    printf '  %-2s %s\n' "13" "一键彻底卸载"
+    printf '  %-2s %s\n' "14" "TCP 窗口调优"
+    printf '  %-2s %s\n' "15" "开启 BBR 加速"
+    printf '  %-2s %s\n' "16" "端口释放"
+    printf '  %-2s %s\n' "17" "核心更新"
+    printf '  %-2s %s\n' "0"  "退出"
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
 
