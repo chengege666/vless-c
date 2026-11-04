@@ -964,15 +964,18 @@ write_config() {
     local new_cfg
     new_cfg="$(mktemp)"
 
-    # 按部署方式决定监听地址/端口与安全层
+    # 按部署方式决定监听地址/端口、安全层与 XHTTP 模式
+    # Tunnel 模式用 packet-up：cloudflared 会缓冲流式响应，stream-up 无法正常工作
     local listen_addr="0.0.0.0"
     local listen_port="$LISTEN_PORT"
     local security="tls"
     local tls_block=""
+    local xhttp_mode="auto"
     if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
         listen_addr="127.0.0.1"
         listen_port="$LOCAL_PORT"
         security="none"
+        xhttp_mode="packet-up"
     else
         tls_block=$'\n        "tlsSettings": {\n          "alpn": [\n            "h2",\n            "http/1.1"\n          ],\n          "certificates": [\n            {\n              "certificateFile": "'"$CERT_DIR"'/fullchain.pem",\n              "keyFile": "'"$CERT_DIR"'/privkey.pem"\n            }\n          ]\n        },'
     fi
@@ -1003,7 +1006,7 @@ write_config() {
         "security": "${security}",${tls_block}
         "xhttpSettings": {
           "path": "${WS_PATH}",
-          "mode": "auto"
+          "mode": "${xhttp_mode}"
         }
       },
       "sniffing": {
@@ -1177,7 +1180,7 @@ print_result() {
             tunnel_label="固定隧道（新建独立隧道）"
         fi
         # TLS 由 Cloudflare 边缘处理，客户端始终用 443
-        link="vless://${UUID}@${TUNNEL_DOMAIN}:443?encryption=none&security=tls&sni=${TUNNEL_DOMAIN}&fp=chrome&type=xhttp&host=${TUNNEL_DOMAIN}&path=${enc_path}&mode=auto&alpn=h2#${NODE_NAME}"
+        link="vless://${UUID}@${TUNNEL_DOMAIN}:443?encryption=none&security=tls&sni=${TUNNEL_DOMAIN}&fp=chrome&type=xhttp&host=${TUNNEL_DOMAIN}&path=${enc_path}&mode=packet-up&alpn=h2#${NODE_NAME}"
 
         printf '\n%s============ cgg-vless XHTTP + CF Tunnel 节点信息 ============%s\n' "$C_CYAN" "$C_RESET"
         printf '  节点名称    : %s\n' "$NODE_NAME"
@@ -1188,7 +1191,7 @@ print_result() {
         printf '  UUID        : %s\n' "$UUID"
         printf '  传输协议    : xhttp\n'
         printf '  XHTTP 路径  : %s\n' "$WS_PATH"
-        printf '  XHTTP 模式  : auto\n'
+        printf '  XHTTP 模式  : packet-up\n'
         printf '  本地回源    : 127.0.0.1:%s\n' "$LOCAL_PORT"
         printf '  SNI         : %s\n' "$TUNNEL_DOMAIN"
         printf '%s============================================================%s\n\n' "$C_CYAN" "$C_RESET"
