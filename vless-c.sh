@@ -660,7 +660,7 @@ show_info_xhttp() {
     enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
     node_name="$(read_node_value "$TAG_XHTTP" NODE_NAME || true)"
     [[ -n "$node_name" ]] || node_name="cgg-vless-xhttp"
-    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}#${node_name}"
+    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}&alpn=h2#${node_name}"
 
     printf '\n%s============ cgg-vless XHTTP + TLS 节点 ============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + XHTTP + TLS\n'
