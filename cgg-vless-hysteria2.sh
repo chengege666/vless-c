@@ -736,16 +736,6 @@ print_result() {
 
     printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
 
-    if command -v qrencode >/dev/null 2>&1; then
-        printf '%s节点二维码：%s\n' "$C_GREEN" "$C_RESET"
-        if ! qrencode -t ANSIUTF8 "$link" 2>/dev/null; then
-            qrencode -t ANSI "$link" 2>/dev/null || warn "二维码生成失败，请直接使用上方链接"
-        fi
-        printf '\n'
-    else
-        warn "未安装 qrencode，跳过二维码输出"
-    fi
-
     printf '%s提示：%s\n' "$C_YELLOW" "$C_RESET"
     printf '  - Hysteria 2 基于 QUIC/UDP，客户端需支持：sing-box / mihomo(Clash.Meta) / 官方 Hysteria 2\n'
     printf '  - 无法套 Cloudflare CDN，必须客户端直连\n'

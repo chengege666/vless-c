@@ -73,7 +73,7 @@ Xray-core 不支持 AnyTLS，该模式由脚本安装 **独立 sing-box 后端**
 | 客户端 | sing-box 系客户端直接支持；v2rayN 需切到 sing-box 内核；FlClash 等 mihomo 系需支持 AnyTLS 的版本 |
 | CDN | **不支持**套 Cloudflare CDN（非 HTTP/WS，无法回源） |
 
-安装时会自动生成 32 位十六进制密码，完成后输出 `anytls://` 链接与二维码；NAT 机需在服务商面板把外部端口映射到相同内部端口。
+安装时会自动生成 32 位十六进制密码，完成后输出 `anytls://` 链接；NAT 机需在服务商面板把外部端口映射到相同内部端口。
 
 
 ## Hysteria 2 模式（总菜单第 5 项）
@@ -89,7 +89,7 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 | 客户端 | sing-box、mihomo(Clash.Meta)、官方 Hysteria 2 客户端 |
 | CDN | **不支持**套 Cloudflare CDN（QUIC 无法回源） |
 
-安装前会检测 UDP 端口占用，安装后自动放行 UDP 端口并校验监听状态；进程异常退出由 systemd `Restart=on-failure` 自动重连。完成后输出 `hysteria2://` 链接与二维码；NAT 机需在服务商面板把 **UDP** 外部端口映射到相同内部端口。
+安装前会检测 UDP 端口占用，安装后自动放行 UDP 端口并校验监听状态；进程异常退出由 systemd `Restart=on-failure` 自动重连。完成后输出 `hysteria2://` 链接；NAT 机需在服务商面板把 **UDP** 外部端口映射到相同内部端口。
 
 
 

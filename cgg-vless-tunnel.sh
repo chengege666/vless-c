@@ -134,13 +134,6 @@ install_deps() {
     else
         log "必要依赖已存在"
     fi
-
-    # qrencode 仅用于二维码输出，安装失败不阻断流程
-    if ! command -v qrencode >/dev/null 2>&1; then
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qrencode >/dev/null 2>&1; then
-            warn "qrencode 安装失败，稍后将只输出 vless:// 链接"
-        fi
-    fi
 }
 
 check_network() {
@@ -796,16 +789,6 @@ print_result() {
     printf '%s防火墙无需放行任何入站端口，Xray 仅监听 127.0.0.1。%s\n\n' "$C_YELLOW" "$C_RESET"
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-
-    if command -v qrencode >/dev/null 2>&1; then
-        printf '%s节点二维码：%s\n' "$C_GREEN" "$C_RESET"
-        if ! qrencode -t ANSIUTF8 "$link" 2>/dev/null; then
-            qrencode -t ANSI "$link" 2>/dev/null || warn "二维码生成失败，请直接使用上方链接"
-        fi
-        printf '\n'
-    else
-        warn "未安装 qrencode，跳过二维码输出"
-    fi
 
     printf '%s服务管理：systemctl {status|restart|stop} xray%s\n' "$C_CYAN" "$C_RESET"
     if [[ "$TUNNEL_TYPE" == "quick" ]]; then

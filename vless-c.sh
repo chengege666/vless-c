@@ -380,20 +380,6 @@ get_public_ip() {
     printf '%s' "$ip"
 }
 
-# ------------------------------ 二维码 ----------------------------------------
-print_qr() {
-    local link="$1"
-    if command -v qrencode >/dev/null 2>&1; then
-        printf '%s节点二维码：%s\n' "$C_GREEN" "$C_RESET"
-        if ! qrencode -t ANSIUTF8 "$link" 2>/dev/null; then
-            qrencode -t ANSI "$link" 2>/dev/null || warn "二维码生成失败，请直接使用上方链接"
-        fi
-        printf '\n'
-    else
-        warn "未安装 qrencode，跳过二维码输出"
-    fi
-}
-
 # ------------------------------ 安装入口 --------------------------------------
 install_reality() {
     if inbound_exists "$TAG_REALITY"; then
@@ -554,7 +540,6 @@ show_info_reality() {
     printf '%s======================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-    print_qr "$link"
 }
 
 # 从证书中提取域名
@@ -616,7 +601,6 @@ show_info_ws() {
     printf '  SNI         : %s\n' "$domain"
     printf '%s===================================================%s\n\n' "$C_CYAN" "$C_RESET"
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-    print_qr "$link"
 }
 
 # 隧道模式（VLESS + WS + CF Tunnel）节点信息
@@ -680,7 +664,6 @@ show_info_tunnel() {
     fi
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-    print_qr "$link"
 }
 
 show_info_anytls() {
@@ -714,7 +697,6 @@ show_info_anytls() {
     printf '  密码        : %s\n' "$password"
     printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
     printf '%sAnyTLS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-    print_qr "$link"
 
     if systemctl is-active --quiet cgg-anytls 2>/dev/null; then
         log "AnyTLS 服务状态：运行中"
@@ -756,7 +738,6 @@ show_info_hysteria2() {
     printf '  ALPN        : h3\n'
     printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
     printf '%sHysteria 2 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-    print_qr "$link"
 
     if systemctl is-active --quiet cgg-hysteria2 2>/dev/null; then
         log "Hysteria 2 服务状态：运行中"

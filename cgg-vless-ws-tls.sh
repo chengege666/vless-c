@@ -132,14 +132,6 @@ install_deps() {
     # 确保 cron 服务可用，acme.sh 依赖其自动续期
     systemctl enable cron >/dev/null 2>&1 || true
     systemctl start cron >/dev/null 2>&1 || warn "cron 服务启动失败，证书自动续期可能受影响"
-
-    # qrencode 仅用于二维码输出，安装失败不阻断流程
-    if ! command -v qrencode >/dev/null 2>&1; then
-        log "安装二维码工具 qrencode"
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qrencode >/dev/null 2>&1; then
-            warn "qrencode 安装失败，稍后将只输出 vless:// 链接"
-        fi
-    fi
 }
 
 check_network() {
@@ -874,16 +866,6 @@ print_result() {
     printf '\n'
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
-
-    if command -v qrencode >/dev/null 2>&1; then
-        printf '%s节点二维码：%s\n' "$C_GREEN" "$C_RESET"
-        if ! qrencode -t ANSIUTF8 "$link" 2>/dev/null; then
-            qrencode -t ANSI "$link" 2>/dev/null || warn "二维码生成失败，请直接使用上方链接"
-        fi
-        printf '\n'
-    else
-        warn "未安装 qrencode，跳过二维码输出"
-    fi
 
     printf '%s证书续期：acme.sh 已自动添加 cron 任务，可执行 "%s --cron" 手动检查%s\n' \
         "$C_CYAN" "$ACME_BIN" "$C_RESET"
