@@ -840,7 +840,7 @@ print_result() {
     fi
 
     # CDN 场景下地址应填 CDN 优选域名/IP，此处默认输出源站 IP
-    link="vless://${UUID}@${ip}:${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')&mode=auto#${NODE_NAME}"
+    link="vless://${UUID}@${ip}:${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')&mode=auto&alpn=h2#${NODE_NAME}"
 
     printf '\n%s============== cgg-vless XHTTP+TLS 节点信息 ==============%s\n' "$C_CYAN" "$C_RESET"
     printf '  节点名称    : %s\n' "$NODE_NAME"
