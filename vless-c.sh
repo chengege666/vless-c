@@ -18,6 +18,7 @@ readonly NODES_DIR="${CONFIG_DIR}/nodes"
 readonly TAG_REALITY="vless-reality"
 readonly TAG_WS="vless-ws-tls"
 readonly TAG_TUNNEL="vless-ws-tunnel"
+readonly TAG_XHTTP="vless-xhttp-tls"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
@@ -44,6 +45,7 @@ readonly SCRIPT_WS="cgg-vless-ws-tls.sh"
 readonly SCRIPT_TUNNEL="cgg-vless-tunnel.sh"
 readonly SCRIPT_ANYTLS="cgg-vless-anytls.sh"
 readonly SCRIPT_HS2="cgg-vless-hysteria2.sh"
+readonly SCRIPT_XHTTP="cgg-vless-xhttp.sh"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -206,6 +208,7 @@ read_node_value() {
         "$TAG_REALITY") mode="reality" ;;
         "$TAG_WS")      mode="ws" ;;
         "$TAG_TUNNEL")  mode="tunnel" ;;
+        "$TAG_XHTTP")   mode="xhttp" ;;
         *) return 1 ;;
     esac
     if [[ -f "$INFO_FILE" ]] && [[ "$(detect_mode)" == "$mode" ]]; then
@@ -237,6 +240,7 @@ tag_desc() {
         "$TAG_REALITY") printf 'VLESS + Reality' ;;
         "$TAG_WS")      printf 'VLESS + WS + TLS' ;;
         "$TAG_TUNNEL")  printf 'VLESS + WS + CF Tunnel' ;;
+        "$TAG_XHTTP")   printf 'VLESS + XHTTP + TLS' ;;
         *)              printf '%s' "$1" ;;
     esac
 }
@@ -244,7 +248,7 @@ tag_desc() {
 # 列出已安装的 Xray 节点 tag（固定顺序）
 xray_node_tags() {
     local t
-    for t in "$TAG_REALITY" "$TAG_WS" "$TAG_TUNNEL"; do
+    for t in "$TAG_REALITY" "$TAG_WS" "$TAG_TUNNEL" "$TAG_XHTTP"; do
         if inbound_exists "$t"; then
             printf '%s\n' "$t"
         fi
@@ -284,6 +288,10 @@ detect_mode() {
         printf 'tunnel'
         return 0
     fi
+    if inbound_exists "$TAG_XHTTP"; then
+        printf 'xhttp'
+        return 0
+    fi
 
     # 兼容旧版无 tag 配置
     local sec net
@@ -296,6 +304,8 @@ detect_mode() {
         printf 'ws'
     elif [[ "$sec" == "none" && "$net" == "ws" ]]; then
         printf 'tunnel'
+    elif [[ "$sec" == "tls" && "$net" == "xhttp" ]]; then
+        printf 'xhttp'
     else
         printf 'unknown'
     fi
@@ -326,9 +336,10 @@ migrate_legacy_config() {
     sec="$(jq -r ".inbounds[${idx}].streamSettings.security // empty" "$CONFIG_FILE" 2>/dev/null || true)"
     net="$(jq -r ".inbounds[${idx}].streamSettings.network // empty" "$CONFIG_FILE" 2>/dev/null || true)"
     case "${sec}:${net}" in
-        reality:*) tag="$TAG_REALITY" ;;
-        tls:ws)    tag="$TAG_WS" ;;
-        none:ws)   tag="$TAG_TUNNEL" ;;
+        reality:*)  tag="$TAG_REALITY" ;;
+        tls:ws)     tag="$TAG_WS" ;;
+        none:ws)    tag="$TAG_TUNNEL" ;;
+        tls:xhttp)  tag="$TAG_XHTTP" ;;
         *) return 0 ;;
     esac
 
@@ -428,6 +439,20 @@ install_anytls() {
 # Hysteria 2 同样使用独立 sing-box 后端，仅在 UDP 端口冲突时由子脚本拦截
 install_hysteria2() {
     run_child "$SCRIPT_HS2"
+}
+
+# XHTTP 与 WS+TLS 同属 Xray 实例，写入 config.json 前由子脚本做端口冲突检测
+install_xhttp() {
+    if inbound_exists "$TAG_XHTTP"; then
+        warn "已安装 XHTTP+TLS 节点，继续安装将覆盖该节点（其他节点不受影响）"
+        local ans
+        read -r -p "确认覆盖？[y/N]：" ans
+        case "$ans" in
+            [Yy]*) ;;
+            *) warn "已取消"; return 1 ;;
+        esac
+    fi
+    run_child "$SCRIPT_XHTTP"
 }
 
 # ------------------------------ 元信息文件读写 --------------------------------
@@ -598,6 +623,54 @@ show_info_ws() {
     printf '  域名        : %s\n' "$domain"
     printf '  UUID        : %s\n' "$uuid"
     printf '  WS 路径     : %s\n' "$path"
+    printf '  SNI         : %s\n' "$domain"
+    printf '%s===================================================%s\n\n' "$C_CYAN" "$C_RESET"
+    printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
+}
+
+# XHTTP 模式（VLESS + XHTTP + TLS）节点信息
+show_info_xhttp() {
+    local port uuid path domain link ip enc_path node_name mode
+    if ! inbound_exists "$TAG_XHTTP"; then
+        err "未找到 XHTTP+TLS 节点配置"
+        return 1
+    fi
+    port="$(inbound_get "$TAG_XHTTP" '.port')"
+    uuid="$(inbound_get "$TAG_XHTTP" '.settings.clients[0].id')"
+    path="$(inbound_get "$TAG_XHTTP" '.streamSettings.xhttpSettings.path')"
+    mode="$(inbound_get "$TAG_XHTTP" '.streamSettings.xhttpSettings.mode')"
+    [[ -n "$mode" ]] || mode="auto"
+
+    if [[ -z "$port" || -z "$uuid" || -z "$path" ]]; then
+        err "配置读取不完整，无法生成链接"
+        return 1
+    fi
+
+    # 优先使用安装时记录的域名，避免证书为泛域名时无法作为 SNI
+    domain="$(read_node_value "$TAG_XHTTP" DOMAIN || true)"
+    if [[ -z "$domain" ]]; then
+        domain="$(extract_cert_domain || true)"
+    fi
+    if [[ -z "$domain" || "$domain" == \*.* ]]; then
+        warn "无法确定可用域名，请手动填写 SNI"
+        domain="YOUR_DOMAIN"
+    fi
+
+    ip="${SERVER_IP:-YOUR_SERVER_IP}"
+    enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
+    node_name="$(read_node_value "$TAG_XHTTP" NODE_NAME || true)"
+    [[ -n "$node_name" ]] || node_name="cgg-vless-xhttp"
+    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}#${node_name}"
+
+    printf '\n%s============ cgg-vless XHTTP + TLS 节点 ============%s\n' "$C_CYAN" "$C_RESET"
+    printf '  模式        : VLESS + XHTTP + TLS\n'
+    printf '  节点名称    : %s\n' "$node_name"
+    printf '  地址 (IP)   : %s\n' "$ip"
+    printf '  端口        : %s\n' "$port"
+    printf '  域名        : %s\n' "$domain"
+    printf '  UUID        : %s\n' "$uuid"
+    printf '  XHTTP 路径  : %s\n' "$path"
+    printf '  XHTTP 模式  : %s\n' "$mode"
     printf '  SNI         : %s\n' "$domain"
     printf '%s===================================================%s\n\n' "$C_CYAN" "$C_RESET"
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
@@ -780,6 +853,12 @@ show_info() {
         fi
     fi
 
+    if inbound_exists "$TAG_XHTTP"; then
+        if show_info_xhttp; then
+            shown=1
+        fi
+    fi
+
     if (( shown == 1 )); then
         if systemctl is-active --quiet xray 2>/dev/null; then
             log "Xray 服务状态：运行中"
@@ -794,7 +873,7 @@ show_info() {
                 # 已无 Xray 节点，继续展示 AnyTLS / Hysteria 2
                 ;;
             unknown)
-                err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel）"
+                err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel / XHTTP+TLS）"
                 ;;
             *)
                 err "未找到有效配置"
@@ -1105,6 +1184,10 @@ change_node_name() {
             current="$(read_node_value "$TAG_TUNNEL" NODE_NAME || true)"
             [[ -n "$current" ]] || current="cgg-vless-tunnel"
             ;;
+        "$TAG_XHTTP")
+            current="$(read_node_value "$TAG_XHTTP" NODE_NAME || true)"
+            [[ -n "$current" ]] || current="cgg-vless-xhttp"
+            ;;
         *)
             err "未找到有效配置，请先执行安装"
             return 1
@@ -1133,6 +1216,9 @@ change_node_name() {
             ;;
         "$TAG_TUNNEL")
             show_info_tunnel
+            ;;
+        "$TAG_XHTTP")
+            show_info_xhttp
             ;;
         *)
             show_info_ws
@@ -2503,7 +2589,7 @@ enable_bbr() {
         fi
         if [[ " $available " != *" bbr "* ]]; then
             err "当前内核不支持 BBR（LXC / OpenVZ 容器常见，由宿主内核决定）"
-            warn "仍可使用菜单 14 的 TCP 窗口调优"
+            warn "仍可使用菜单 15 的 TCP 窗口调优"
             return 1
         fi
     fi
@@ -2572,18 +2658,19 @@ show_menu() {
     printf '  %-2s %s\n' "3"  "安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）"
     printf '  %-2s %s\n' "4"  "安装 AnyTLS + TLS 节点（sing-box 后端）"
     printf '  %-2s %s\n' "5"  "安装 Hysteria 2 节点（sing-box 后端）"
-    printf '  %-2s %s\n' "6"  "查看当前节点配置与连接链接"
-    printf '  %-2s %s\n' "7"  "启动 Xray 服务"
-    printf '  %-2s %s\n' "8"  "停止 Xray 服务"
-    printf '  %-2s %s\n' "9"  "重启 Xray 服务"
-    printf '  %-2s %s\n' "10" "修改配置"
-    printf '  %-2s %s\n' "11" "SSL 证书管理"
-    printf '  %-2s %s\n' "12" "卸载指定节点"
-    printf '  %-2s %s\n' "13" "一键彻底卸载"
-    printf '  %-2s %s\n' "14" "TCP 窗口调优"
-    printf '  %-2s %s\n' "15" "开启 BBR 加速"
-    printf '  %-2s %s\n' "16" "端口释放"
-    printf '  %-2s %s\n' "17" "核心更新"
+    printf '  %-2s %s\n' "6"  "安装 VLESS + XHTTP + TLS 节点（CDN）"
+    printf '  %-2s %s\n' "7"  "查看当前节点配置与连接链接"
+    printf '  %-2s %s\n' "8"  "启动 Xray 服务"
+    printf '  %-2s %s\n' "9"  "停止 Xray 服务"
+    printf '  %-2s %s\n' "10" "重启 Xray 服务"
+    printf '  %-2s %s\n' "11" "修改配置"
+    printf '  %-2s %s\n' "12" "SSL 证书管理"
+    printf '  %-2s %s\n' "13" "卸载指定节点"
+    printf '  %-2s %s\n' "14" "一键彻底卸载"
+    printf '  %-2s %s\n' "15" "TCP 窗口调优"
+    printf '  %-2s %s\n' "16" "开启 BBR 加速"
+    printf '  %-2s %s\n' "17" "端口释放"
+    printf '  %-2s %s\n' "18" "核心更新"
     printf '  %-2s %s\n' "0"  "退出"
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -2598,7 +2685,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-17]：" choice; then
+        if ! read -r -p "请选择 [0-18]：" choice; then
             printf '\n'
             return 0
         fi
@@ -2608,18 +2695,19 @@ main_menu() {
             3) install_tunnel || true ;;
             4) install_anytls || true ;;
             5) install_hysteria2 || true ;;
-            6) show_info || true ;;
-            7) service_action start || true ;;
-            8) service_action stop || true ;;
-            9) service_action restart || true ;;
-            10) modify_menu || true ;;
-            11) cert_menu ;;
-            12) uninstall_node_menu || true ;;
-            13) uninstall_all || true ;;
-            14) enable_tcp_tune || true ;;
-            15) enable_bbr || true ;;
-            16) release_ports || true ;;
-            17) core_update_menu || true ;;
+            6) install_xhttp || true ;;
+            7) show_info || true ;;
+            8) service_action start || true ;;
+            9) service_action stop || true ;;
+            10) service_action restart || true ;;
+            11) modify_menu || true ;;
+            12) cert_menu ;;
+            13) uninstall_node_menu || true ;;
+            14) uninstall_all || true ;;
+            15) enable_tcp_tune || true ;;
+            16) enable_bbr || true ;;
+            17) release_ports || true ;;
+            18) core_update_menu || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac

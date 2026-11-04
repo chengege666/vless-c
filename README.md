@@ -1,6 +1,6 @@
 # cgg-vless
 
-一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** / **Hysteria 2** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
+一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + XHTTP + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** / **Hysteria 2** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
 
 VLESS 系列统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议；AnyTLS 与 Hysteria 2 因 Xray-core 不支持，使用独立 sing-box 后端。
 
@@ -57,7 +57,7 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 
 固定隧道网页端配置：**Zero Trust → Networks → Tunnels → Public Hostname**，Type 选 **HTTP**，URL 填 `http://localhost:本地端口`（默认 8001，必须带 `http://` 协议头），保存后 DNS 记录自动创建。
 
-临时隧道域名重启后会变化，用总菜单第 `6` 项重新查看即可获取最新域名；仅建议测试使用。
+临时隧道域名重启后会变化，用总菜单第 `7` 项重新查看即可获取最新域名；仅建议测试使用。
 
 
 ## AnyTLS + TLS 模式（总菜单第 4 项）
@@ -92,6 +92,22 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 安装前会检测 UDP 端口占用，安装后自动放行 UDP 端口并校验监听状态；进程异常退出由 systemd `Restart=on-failure` 自动重连。完成后输出 `hysteria2://` 链接；NAT 机需在服务商面板把 **UDP** 外部端口映射到相同内部端口。
 
 
+## VLESS + XHTTP + TLS 模式（总菜单第 6 项）
+
+基于 Xray-core 的 XHTTP 传输层，配置、服务与元信息与其他 Xray 节点并存；仅新增 `inbounds` 条目，不影响已安装节点。
+
+| 项目 | 说明 |
+|---|---|
+| 是否需要域名 | 需要，并解析到本机（证书与 SNI） |
+| 证书 | Let's Encrypt（acme.sh），或复用 `/usr/local/etc/xray/cert` |
+| 默认端口 | 443（可自定义，NAT 机填映射范围内的端口） |
+| 传输 | xhttp（`mode: auto`，ALPN `h2` / `http/1.1`） |
+| 客户端 | 支持 XHTTP 的 Xray 内核（v2rayN / v2rayNG / sing-box 等较新版本） |
+| CDN | 支持 Cloudflare CDN，要求 Full (strict) |
+
+安装完成后输出 `type=xhttp` 分享链接。若 Xray 配置校验提示不支持 xhttp，请先在总菜单第 `18` 项执行核心更新。
+
+
 
 
 ## Cloudflare CDN 配置建议
@@ -113,7 +129,7 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
    - 监听端口在 Cloudflare 支持列表内（443 / 2053 / 2083 / 2087 / 2096 / 8443）→ 客户端直接用该端口连接，无需额外配置
    - 监听端口不在列表内 → 在 Cloudflare 的 **Origin Rules** 新建规则，将回源端口（Destination Port）改为监听端口，客户端端口填 443
 4. 证书申请：NAT 机通常没有 80 端口，HTTP-01 会失败，改用以下方式之一：
-   - DNS-01 验证（总菜单 `11` → `3`，支持 Cloudflare / 阿里云）
+   - DNS-01 验证（总菜单 `12` → `3`，支持 Cloudflare / 阿里云）
    - 使用本机已有证书文件（证书来源选 `2`，直接填 `.cer` / `.key` 路径）
    - 使用已安装到 `/usr/local/etc/xray/cert` 的证书（证书来源选 `3`）
 
@@ -125,13 +141,13 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 修改配置：
 
-- 所有模式均可在总菜单第 `10` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 已安装时该菜单额外提供对应的节点名称修改项
+- 所有模式均可在总菜单第 `11` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 已安装时该菜单额外提供对应的节点名称修改项
 - Reality：同一菜单可更换 SNI 或重置 UUID
 - WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
 卸载指定节点：
 
-- 总菜单第 `12` 项，选择要卸载的节点后输入 `yes` 确认
+- 总菜单第 `13` 项，选择要卸载的节点后输入 `yes` 确认
 - 仅删除该节点的配置、元信息与对应服务，其他节点不受影响
 - 删除最后一个 Xray 节点时会停止并移除 `xray.service`，保留二进制、日志与配置文件
 - CF Tunnel 节点会额外确认是否删除 `cloudflared` / `cgg-quick-tunnel` 服务（保留 cloudflared 主程序）
@@ -139,9 +155,9 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 彻底卸载：
 
-- 总菜单第 `13` 项，输入 `yes` 确认
+- 总菜单第 `14` 项，输入 `yes` 确认
 - 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS / Hysteria 2（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
-- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 11 项 → 8
+- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 12 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
 ```bash

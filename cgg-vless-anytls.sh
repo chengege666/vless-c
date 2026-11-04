@@ -328,12 +328,12 @@ ask_cert_source() {
     warn "未检测到 ${XRAY_CERT_DIR} 下的证书"
     printf '  1) 手动输入证书文件路径（.cer / .key）\n'
     printf '  2) 生成自签证书（客户端需跳过证书验证）\n'
-    printf '  3) 取消，先去总菜单第 11 项申请证书\n'
+    printf '  3) 取消，先去总菜单第 12 项申请证书\n'
     read -r -p "请选择 [1-3]：" ans
     case "$ans" in
         1) setup_cert_manual ;;
         2) setup_cert_selfsigned ;;
-        *) die "已取消：请先在总菜单第 11 项申请证书，或准备好证书文件后重跑" ;;
+        *) die "已取消：请先在总菜单第 12 项申请证书，或准备好证书文件后重跑" ;;
     esac
 }
 
