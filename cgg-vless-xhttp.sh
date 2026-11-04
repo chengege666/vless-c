@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ==============================================================================
 # cgg-vless · VLESS + XHTTP + TLS（CDN / 直连部署）
 # 适用系统：Ubuntu 20.04+ / Debian 11+
