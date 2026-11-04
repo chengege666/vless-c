@@ -1907,7 +1907,8 @@ uninstall_all() {
 }
 
 # ------------------------------ 端口释放 --------------------------------------
-# 收集本脚本记录的端口，输出格式：协议|端口|来源|类型（main=监听端口，hop=端口跳跃）
+# 收集本脚本记录的端口，输出格式：协议|端口|来源|类型|对应服务
+# 类型：main=监听端口，hop=端口跳跃
 collect_script_ports() {
     local t port hop item
     while IFS= read -r t; do
@@ -1919,7 +1920,7 @@ collect_script_ports() {
         fi
         [[ -n "$port" ]] || port="$(inbound_get "$t" '.port' 2>/dev/null || true)"
         if [[ -n "$port" ]]; then
-            printf 'tcp|%s|%s|main\n' "$port" "$(tag_desc "$t")"
+            printf 'tcp|%s|%s|main|xray\n' "$port" "$(tag_desc "$t")"
         fi
     done < <(xray_node_tags)
 
@@ -1927,7 +1928,7 @@ collect_script_ports() {
         port="$(read_anytls_info PORT 2>/dev/null || true)"
         [[ -n "$port" ]] || port="$(jq -r '.inbounds[0].listen_port // empty' "$ANYTLS_CONFIG" 2>/dev/null || true)"
         if [[ -n "$port" ]]; then
-            printf 'tcp|%s|AnyTLS|main\n' "$port"
+            printf 'tcp|%s|AnyTLS|main|cgg-anytls\n' "$port"
         fi
     fi
 
@@ -1935,7 +1936,7 @@ collect_script_ports() {
         port="$(read_hysteria2_info PORT 2>/dev/null || true)"
         [[ -n "$port" ]] || port="$(jq -r '.inbounds[0].listen_port // empty' "$HS2_CONFIG" 2>/dev/null || true)"
         if [[ -n "$port" ]]; then
-            printf 'udp|%s|Hysteria 2|main\n' "$port"
+            printf 'udp|%s|Hysteria 2|main|cgg-hysteria2\n' "$port"
         fi
         hop="$(read_hysteria2_info HOP 2>/dev/null || true)"
         if [[ -n "$hop" ]]; then
@@ -1943,7 +1944,7 @@ collect_script_ports() {
             IFS=',' read -r -a hop_items <<< "$hop"
             for item in "${hop_items[@]}"; do
                 [[ -n "$item" ]] || continue
-                printf 'udp|%s|Hysteria 2 端口跳跃|hop\n' "$item"
+                printf 'udp|%s|Hysteria 2 端口跳跃|hop|cgg-hysteria2-hop\n' "$item"
             done
         fi
     fi
@@ -1992,10 +1993,12 @@ remove_firewall_allow() {
     fi
 }
 
-# 端口释放：停止本脚本的节点服务并清理对应端口的防火墙放行规则，不删除配置与程序
+# 端口释放：按编号选择指定端口，停止对应服务并清理该端口的防火墙放行规则
 release_ports() {
-    local ans line proto port desc kind svc still=0
-    local -a items=()
+    local ans line proto port desc kind svc n idx key still=0
+    local -a items=() chosen=() services=()
+    local -A seen_item=() seen_svc=()
+
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         items+=("$line")
@@ -2007,48 +2010,106 @@ release_ports() {
     fi
 
     printf '\n%s-------- 端口释放 --------%s\n' "$C_CYAN" "$C_RESET"
-    for line in "${items[@]}"; do
-        IFS='|' read -r proto port desc kind <<< "$line"
+    for idx in "${!items[@]}"; do
+        IFS='|' read -r proto port desc kind svc <<< "${items[$idx]}"
         if [[ "$kind" == "hop" ]]; then
-            printf '  %-14s %-30s %s\n' "${port}/${proto}" "$desc" "端口跳跃规则（nat）"
+            printf '  %2d) %-14s %-30s %s\n' "$((idx + 1))" "${port}/${proto}" "$desc" "端口跳跃规则（nat）"
         else
-            printf '  %-14s %-30s %s\n' "${port}/${proto}" "$desc" "$(port_holder_desc "$proto" "$port")"
+            printf '  %2d) %-14s %-30s %s\n' "$((idx + 1))" "${port}/${proto}" "$desc" "$(port_holder_desc "$proto" "$port")"
         fi
     done
     printf '%s--------------------------%s\n' "$C_CYAN" "$C_RESET"
 
-    warn "该操作将停止本脚本创建的 Xray / AnyTLS / Hysteria 2 服务，并只删除上述端口的 UFW / iptables 放行规则"
-    warn "不会删除配置与程序；重启系统后服务会重新占用这些端口，如需彻底释放请使用卸载功能"
-    read -r -p "确认释放端口？[yes/N]：" ans
+    if ! read -r -p "请输入要释放的端口编号（空格分隔，可多选；回车取消）：" ans; then
+        printf '\n'
+        warn "已取消"
+        return 1
+    fi
+    if [[ -z "$ans" ]]; then
+        warn "已取消"
+        return 1
+    fi
+
+    # 逐项解析编号并去重，非法编号只警告不中断
+    for n in $ans; do
+        if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+            warn "忽略无效编号：${n}"
+            continue
+        fi
+        idx=$((10#$n))
+        if (( idx < 1 || idx > ${#items[@]} )); then
+            warn "忽略超出范围的编号：${n}"
+            continue
+        fi
+        key="${items[idx - 1]}"
+        if [[ -n "${seen_item[$key]:-}" ]]; then
+            continue
+        fi
+        seen_item["$key"]=1
+        chosen+=("$key")
+    done
+
+    if (( ${#chosen[@]} == 0 )); then
+        err "未选择有效的端口编号"
+        return 1
+    fi
+
+    # 汇总所选端口需要停止的服务
+    for line in "${chosen[@]}"; do
+        IFS='|' read -r proto port desc kind svc <<< "$line"
+        if [[ -z "${seen_svc[$svc]:-}" ]]; then
+            seen_svc["$svc"]=1
+            services+=("$svc")
+        fi
+    done
+
+    printf '%s本次将释放：%s\n' "$C_YELLOW" "$C_RESET"
+    for line in "${chosen[@]}"; do
+        IFS='|' read -r proto port desc kind svc <<< "$line"
+        printf '  %s/%s（%s）\n' "$port" "$proto" "$desc"
+    done
+    warn "将停止服务：${services[*]}"
+    warn "注意：停止 xray 会同时释放该实例下全部 Xray 节点端口；停止 cgg-hysteria2 会中断 Hysteria 2 节点"
+    warn "只删除所选端口的 UFW / iptables 放行规则，不删除配置与程序"
+    if ! read -r -p "确认释放以上端口？[yes/N]：" ans; then
+        printf '\n'
+        warn "已取消"
+        return 1
+    fi
     if [[ "$ans" != "yes" ]]; then
         warn "已取消"
         return 1
     fi
 
-    # 端口跳跃服务需先停止，其 ExecStop 会清理 nat REDIRECT 规则
-    if systemctl cat cgg-hysteria2-hop >/dev/null 2>&1; then
-        systemctl stop cgg-hysteria2-hop >/dev/null 2>&1 || warn "停止 cgg-hysteria2-hop 失败"
-    elif [[ -f "${SINGBOX_DIR}/port-hopping.sh" ]]; then
-        bash "${SINGBOX_DIR}/port-hopping.sh" stop >/dev/null 2>&1 \
-            || warn "清理端口跳跃 nat 规则失败，请手动检查"
+    # 端口跳跃服务优先停止，其 ExecStop 会清理 nat REDIRECT 规则
+    if [[ -n "${seen_svc[cgg-hysteria2-hop]:-}" ]]; then
+        if systemctl cat cgg-hysteria2-hop >/dev/null 2>&1; then
+            systemctl stop cgg-hysteria2-hop >/dev/null 2>&1 || warn "停止 cgg-hysteria2-hop 失败"
+        elif [[ -f "${SINGBOX_DIR}/port-hopping.sh" ]]; then
+            bash "${SINGBOX_DIR}/port-hopping.sh" stop >/dev/null 2>&1 \
+                || warn "清理端口跳跃 nat 规则失败，请手动检查"
+        fi
     fi
 
-    for svc in xray cgg-anytls cgg-hysteria2; do
+    for svc in "${services[@]}"; do
+        if [[ "$svc" == "cgg-hysteria2-hop" ]]; then
+            continue
+        fi
         if systemctl cat "$svc" >/dev/null 2>&1; then
             systemctl stop "$svc" >/dev/null 2>&1 || warn "停止服务 ${svc} 失败"
         fi
     done
     sleep 1
 
-    for line in "${items[@]}"; do
-        IFS='|' read -r proto port desc kind <<< "$line"
+    for line in "${chosen[@]}"; do
+        IFS='|' read -r proto port desc kind svc <<< "$line"
         [[ "$kind" == "main" ]] || continue
         remove_firewall_allow "$proto" "$port"
         log "已尝试清理端口 ${port}/${proto} 的防火墙放行规则（来源：${desc}）"
     done
 
-    for line in "${items[@]}"; do
-        IFS='|' read -r proto port desc kind <<< "$line"
+    for line in "${chosen[@]}"; do
+        IFS='|' read -r proto port desc kind svc <<< "$line"
         [[ "$kind" == "main" ]] || continue
         if port_still_in_use "$proto" "$port"; then
             warn "端口 ${port}/${proto} 仍被占用：$(port_holder_desc "$proto" "$port")"
