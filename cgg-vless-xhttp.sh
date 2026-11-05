@@ -4,8 +4,9 @@
 # 适用系统：Ubuntu 20.04+ / Debian 11+
 # 用    法：sudo bash cgg-vless-xhttp.sh
 # 说    明：
-#   需域名 + 证书（acme.sh 申请），Xray 监听公网端口
-#   如需 Cloudflare Tunnel 部署，请使用 WS+TLS 模式（cgg-vless-ws-tls.sh）
+#   直连 / CDN：需域名 + 证书（acme.sh 申请），Xray 监听公网端口
+#   Cloudflare Tunnel：固定 / 临时隧道，Xray 仅监听 127.0.0.1（security: none），
+#     TLS 由 Cloudflare 边缘承担，无需域名证书与入站端口；隧道模式 XHTTP 固定 packet-up
 # ==============================================================================
 set -euo pipefail
 
@@ -16,8 +17,11 @@ readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly INFO_FILE="${CONFIG_DIR}/cgg-vless.info"
 # 每个节点独立保存元信息，支持多个协议节点并存
 readonly NODES_DIR="${CONFIG_DIR}/nodes"
-readonly NODE_TAG="vless-xhttp-tls"
-readonly NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
+# 直连与隧道使用不同 tag，便于与其他节点并存并由总菜单区分
+readonly NODE_TAG_DIRECT="vless-xhttp-tls"
+readonly NODE_TAG_TUNNEL="vless-xhttp-tunnel"
+NODE_TAG="${NODE_TAG_DIRECT}"
+NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
 # AnyTLS 使用独立配置，端口冲突检测需要读取
 readonly ANYTLS_CONFIG="/usr/local/etc/sing-box/config.json"
@@ -29,6 +33,12 @@ readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-rele
 # Cloudflare 支持的 HTTPS 端口（回源提示用）
 readonly CF_HTTPS_PORTS="443 2053 2083 2087 2096 8443"
 readonly DEFAULT_NODE_NAME="cgg-vless-xhttp"
+# Cloudflare Tunnel（与 WS 隧道共用 cloudflared / cgg-quick-tunnel 服务）
+readonly CFDD_BIN="/usr/local/bin/cloudflared"
+readonly CFDD_URL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
+readonly CFDD_CONFIG_FILE="/etc/cloudflared/config.yml"
+readonly QUICK_SERVICE="cgg-quick-tunnel"
+readonly DEFAULT_LOCAL_PORT="8002"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -58,6 +68,13 @@ LISTEN_PORT="443"
 SERVER_IP=""
 RUN_USER="nobody"
 RUN_GROUP="nogroup"
+# 隧道部署相关
+DEPLOY_MODE="direct"
+TUNNEL_TYPE="fixed"
+TUNNEL_REUSE="0"
+CF_TOKEN="${CF_TUNNEL_TOKEN:-}"
+LOCAL_PORT="${DEFAULT_LOCAL_PORT}"
+TUNNEL_DOMAIN=""
 
 # ------------------------------ 日志函数 --------------------------------------
 log()  { printf '%s[INFO]%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
@@ -337,6 +354,138 @@ ask_listen_port() {
     esac
 }
 
+# ------------------------------ 部署方式与隧道 --------------------------------
+# 选择部署方式：直连 / CDN 或 Cloudflare Tunnel
+ask_deploy_mode() {
+    # 环境变量 CF_TUNNEL_TOKEN 存在时自动使用固定隧道，便于无人值守安装
+    if [[ -n "$CF_TOKEN" ]]; then
+        DEPLOY_MODE="tunnel"
+        TUNNEL_TYPE="fixed"
+        TUNNEL_REUSE="0"
+        log "检测到环境变量 CF_TUNNEL_TOKEN，使用 Cloudflare 固定隧道模式（新建独立隧道）"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        log "非交互模式：使用直连 / CDN 部署"
+        return 0
+    fi
+
+    printf '\n选择部署方式：\n'
+    printf '  1) 直连 / CDN（Xray 监听公网端口，需域名与证书）\n'
+    printf '  2) Cloudflare Tunnel（固定 / 临时隧道，无需公网端口与证书）\n'
+    local choice
+    read -r -p "请选择 [1-2]（回车默认 1）：" choice || return 0
+    case "${choice:-1}" in
+        1) DEPLOY_MODE="direct" ;;
+        2) DEPLOY_MODE="tunnel" ;;
+        *) warn "无效选项，使用直连 / CDN"; DEPLOY_MODE="direct" ;;
+    esac
+    if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
+        log "部署方式：Cloudflare Tunnel"
+    else
+        log "部署方式：直连 / CDN"
+    fi
+}
+
+# 隧道类型：固定（新建 / 复用）或临时（quick tunnel）
+ask_tunnel_type() {
+    local choice fixed_choice
+    if [[ -n "$CF_TOKEN" ]]; then
+        TUNNEL_TYPE="fixed"
+        TUNNEL_REUSE="0"
+        log "使用环境变量 Token，固定隧道模式（新建独立隧道）"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        die "当前为非交互环境，请提供隧道 Token：CF_TUNNEL_TOKEN=xxx bash $0"
+    fi
+
+    printf '\n选择隧道类型：\n'
+    printf '  1) 固定隧道（域名固定，需域名 NS 托管在 Cloudflare）\n'
+    printf '  2) 临时隧道（无需账号域名，域名随机且每次重启都会变化，仅测试用）\n'
+    read -r -p "请选择 [1-2]（回车默认 1）：" choice || true
+    case "${choice:-1}" in
+        1) TUNNEL_TYPE="fixed" ;;
+        2) TUNNEL_TYPE="quick" ;;
+        *) warn "无效选项，使用固定隧道"; TUNNEL_TYPE="fixed" ;;
+    esac
+
+    TUNNEL_REUSE="0"
+    if [[ "$TUNNEL_TYPE" == "fixed" ]]; then
+        printf '\n固定隧道模式：\n'
+        printf '  1) 新建独立隧道（网页创建后粘贴 Token，回车默认）\n'
+        printf '  2) 复用本机已有隧道（沿用现有 cloudflared 服务与配置，不重装不清理）\n'
+        read -r -p "请选择 [1-2]（回车默认 1）：" fixed_choice || true
+        case "${fixed_choice:-1}" in
+            1) TUNNEL_REUSE="0" ;;
+            2) TUNNEL_REUSE="1" ;;
+            *) warn "无效选项，使用新建独立隧道"; TUNNEL_REUSE="0" ;;
+        esac
+    fi
+
+    if [[ "$TUNNEL_TYPE" == "fixed" ]]; then
+        if [[ "$TUNNEL_REUSE" == "1" ]]; then
+            log "隧道类型：固定隧道（复用已有隧道）"
+        else
+            log "隧道类型：固定隧道（新建独立隧道）"
+        fi
+    else
+        log "隧道类型：临时隧道"
+    fi
+}
+
+# 隧道模式下 Xray 仅监听 127.0.0.1 的本地回源端口
+ask_local_port() {
+    local input conflict
+
+    if [[ ! -t 0 ]]; then
+        if port_in_use "$LOCAL_PORT"; then
+            if own_running_port "$LOCAL_PORT"; then
+                warn "本地端口 ${LOCAL_PORT} 为当前节点正在使用的端口，将继续复用"
+            else
+                die "本地端口 ${LOCAL_PORT} 已被占用，请手动指定其他端口"
+            fi
+        fi
+        if conflict="$(port_config_conflict "$LOCAL_PORT" "$NODE_TAG")"; then
+            die "本地端口 ${LOCAL_PORT} 已被${conflict}占用，请手动指定其他端口"
+        fi
+        log "非交互模式：使用默认本地端口 ${LOCAL_PORT}"
+        return 0
+    fi
+
+    read -r -p "Xray 本地监听端口（仅 127.0.0.1 回源用，回车默认 ${DEFAULT_LOCAL_PORT}）：" input || return 0
+    input="${input//[[:space:]]/}"
+    if [[ -z "$input" ]]; then
+        if port_in_use "$LOCAL_PORT"; then
+            if own_running_port "$LOCAL_PORT"; then
+                warn "本地端口 ${LOCAL_PORT} 为当前节点正在使用的端口，将继续复用"
+            else
+                die "本地端口 ${LOCAL_PORT} 已被占用，请手动指定其他端口"
+            fi
+        fi
+        if conflict="$(port_config_conflict "$LOCAL_PORT" "$NODE_TAG")"; then
+            die "本地端口 ${LOCAL_PORT} 已被${conflict}占用，请手动指定其他端口"
+        fi
+        log "本地端口：${LOCAL_PORT}"
+        return 0
+    fi
+    if [[ ! "$input" =~ ^[0-9]+$ ]] || (( 10#$input < 1 || 10#$input > 65535 )); then
+        die "端口不合法：${input}"
+    fi
+    if port_in_use "$input"; then
+        if own_running_port "$input"; then
+            warn "端口 ${input} 为当前节点正在使用的端口，将继续复用"
+        else
+            die "端口 ${input} 已被占用，请更换"
+        fi
+    fi
+    if conflict="$(port_config_conflict "$input" "$NODE_TAG")"; then
+        die "端口 ${input} 已被${conflict}占用，请更换"
+    fi
+    LOCAL_PORT="$input"
+    log "本地端口：${LOCAL_PORT}"
+}
+
 # ------------------------------ 端口占用 --------------------------------------
 free_port_80() {
     local holders=""
@@ -584,6 +733,218 @@ gen_ws_path() {
     log "XHTTP 路径生成完成：${WS_PATH}"
 }
 
+# ------------------------------ cloudflared -----------------------------------
+ensure_cloudflared() {
+    if [[ -x "$CFDD_BIN" ]]; then
+        log "检测到已安装 cloudflared：$("$CFDD_BIN" --version 2>/dev/null | head -n 1)"
+        return 0
+    fi
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        *) die "暂不支持的架构：$(uname -m)，请手动安装 cloudflared 到 ${CFDD_BIN}" ;;
+    esac
+
+    log "下载 cloudflared（${arch}）..."
+    if ! curl -fsSL --retry 3 --connect-timeout 15 -o "$CFDD_BIN" "${CFDD_URL_BASE}/cloudflared-linux-${arch}"; then
+        rm -f "$CFDD_BIN"
+        die "cloudflared 下载失败；网络受限时可手动下载后放置到 ${CFDD_BIN} 并 chmod +x，再重跑本脚本"
+    fi
+    chmod +x "$CFDD_BIN"
+    [[ -x "$CFDD_BIN" ]] || die "cloudflared 安装异常"
+    log "cloudflared 安装完成：$("$CFDD_BIN" --version 2>/dev/null | head -n 1)"
+}
+
+# 清理固定隧道与临时隧道的残留服务，避免切换类型后旧隧道继续运行
+cleanup_tunnel_services() {
+    local svc found=0
+
+    for svc in cloudflared cloudflared-update cgg-quick-tunnel; do
+        if systemctl cat "$svc" >/dev/null 2>&1 || [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+            found=1
+        fi
+    done
+    if (( found == 0 )); then
+        return 0
+    fi
+
+    warn "检测到旧隧道服务残留，将先停止并清理（若本机还有其他项目在用 cloudflared 隧道，请先确认）"
+    if [[ -x "$CFDD_BIN" ]]; then
+        "$CFDD_BIN" service uninstall >/dev/null 2>&1 || true
+    fi
+    for svc in cloudflared cloudflared-update cgg-quick-tunnel; do
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+        systemctl disable "$svc" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${svc}.service"
+    done
+    systemctl daemon-reload
+    log "旧隧道服务清理完成"
+}
+
+# ------------------------------ 固定隧道 --------------------------------------
+# 复用本机已有隧道：不重装、不清理现有 cloudflared 服务，只校验回源是否指向本机端口
+setup_fixed_tunnel_reuse() {
+    local svc="" svc_found=0 input
+
+    printf '\n%s-------- 复用已有隧道检查 --------%s\n' "$C_CYAN" "$C_RESET"
+
+    [[ -x "$CFDD_BIN" ]] || die "未找到 cloudflared：${CFDD_BIN}，无法复用已有隧道"
+
+    for svc in cloudflared cloudflared-update; do
+        if systemctl cat "$svc" >/dev/null 2>&1 || [[ -f "/etc/systemd/system/${svc}.service" ]]; then
+            svc_found=1
+            break
+        fi
+    done
+    if (( svc_found == 0 )); then
+        die "未检测到已有的 cloudflared 服务，无法复用；请改选“新建独立隧道”"
+    fi
+
+    if systemctl is-active --quiet "$svc"; then
+        log "已有隧道服务运行中：${svc}（未做任何改动）"
+    else
+        warn "已有隧道服务 ${svc} 未运行，请确认：systemctl status ${svc}"
+    fi
+
+    if [[ -f "$CFDD_CONFIG_FILE" ]]; then
+        if grep -q "http://localhost:${LOCAL_PORT}" "$CFDD_CONFIG_FILE" 2>/dev/null \
+            || grep -q "http://127.0.0.1:${LOCAL_PORT}" "$CFDD_CONFIG_FILE" 2>/dev/null; then
+            log "现有配置已包含回源：http://localhost:${LOCAL_PORT}"
+        else
+            warn "现有配置 ${CFDD_CONFIG_FILE} 未指向本机端口 ${LOCAL_PORT}"
+            printf '%s请在该文件的 ingress 中补一条（放在 http_status:404 之前）：%s\n' "$C_YELLOW" "$C_RESET"
+            printf '  - hostname: 你的域名\n'
+            printf '    service: http://localhost:%s\n' "$LOCAL_PORT"
+            printf '%s修改后执行 systemctl restart %s。%s\n' "$C_YELLOW" "$svc" "$C_RESET"
+        fi
+    else
+        warn "未找到 ${CFDD_CONFIG_FILE}（Token 托管的隧道在网页端配置回源）"
+        printf '%s请在 Cloudflare 控制台 → 该隧道 → Public Hostname 中确认：%s\n' "$C_YELLOW" "$C_RESET"
+        printf '    Type : HTTP\n'
+        printf '    URL  : http://localhost:%s\n' "$LOCAL_PORT"
+    fi
+
+    if [[ -t 0 ]]; then
+        read -r -p "请输入该隧道已配置的域名（如 xhttp.example.com，回车可跳过）：" input || return 0
+        input="${input//[[:space:]]/}"
+        if [[ -n "$input" ]]; then
+            validate_domain "$input" || die "域名格式不合法：${input}"
+            TUNNEL_DOMAIN="$input"
+            save_info
+        fi
+    fi
+}
+
+setup_fixed_tunnel() {
+    # 复用模式走独立分支，避免清理并覆盖本机已有的 cloudflared 服务
+    if [[ "$TUNNEL_REUSE" == "1" ]]; then
+        setup_fixed_tunnel_reuse
+        return 0
+    fi
+
+    printf '\n%s-------- 固定隧道配置提示 --------%s\n' "$C_CYAN" "$C_RESET"
+    printf '  1) 登录 Cloudflare 控制台 → Zero Trust → Networks → Tunnels\n'
+    printf '  2) Create a tunnel → 类型选 Cloudflared → 填写隧道名\n'
+    printf '  3) 复制网页给出的 Token（安装命令 eyJ 开头的一长串）\n'
+    printf '%s----------------------------------%s\n' "$C_CYAN" "$C_RESET"
+
+    if [[ -z "$CF_TOKEN" ]]; then
+        [[ -t 0 ]] || die "固定隧道需要 Token：CF_TUNNEL_TOKEN=xxx bash $0"
+        read -r -s -p "粘贴隧道 Token（输入内容不回显，回车确认）：" CF_TOKEN
+        printf '\n'
+    fi
+    [[ -n "$CF_TOKEN" ]] || die "Token 不能为空"
+
+    # 重装或从临时隧道切换时先清理旧服务，否则 service install 会报 "already installed"
+    cleanup_tunnel_services
+
+    log "注册 cloudflared 服务..."
+    if ! "$CFDD_BIN" service install "$CF_TOKEN"; then
+        die "cloudflared 服务注册失败，请确认 Token 正确后重试"
+    fi
+
+    sleep 2
+    if systemctl is-active --quiet cloudflared; then
+        log "cloudflared 服务运行中，连接器状态可在网页查看"
+    else
+        warn "cloudflared 服务未运行，请稍后执行：systemctl status cloudflared"
+    fi
+
+    printf '\n%s请在网页端完成 Public Hostname 配置（本机侧已就绪）：%s\n' "$C_YELLOW" "$C_RESET"
+    printf '  Public Hostname → Add a public hostname\n'
+    printf '    Subdomain / Domain : 你的域名\n'
+    printf '    Type               : HTTP\n'
+    printf '    URL                : http://localhost:%s\n' "$LOCAL_PORT"
+    printf '%s保存后 DNS 记录自动创建并强制代理。%s\n' "$C_YELLOW" "$C_RESET"
+
+    if [[ -t 0 ]]; then
+        local input
+        read -r -p "请输入网页端配置的隧道域名（如 xhttp.example.com，回车可跳过）：" input || return 0
+        input="${input//[[:space:]]/}"
+        if [[ -n "$input" ]]; then
+            validate_domain "$input" || die "域名格式不合法：${input}"
+            TUNNEL_DOMAIN="$input"
+            save_info
+        fi
+    fi
+}
+
+# ------------------------------ 临时隧道 --------------------------------------
+# 从服务日志提取最新的 trycloudflare.com 域名
+quick_tunnel_url() {
+    journalctl -u "$QUICK_SERVICE" --no-pager -n 200 2>/dev/null \
+        | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -n 1 || true
+}
+
+setup_quick_tunnel() {
+    local unit_file="/etc/systemd/system/${QUICK_SERVICE}.service"
+
+    # 重装或从固定隧道切换时先清理旧服务，避免旧隧道继续运行
+    cleanup_tunnel_services
+
+    log "写入临时隧道服务：${unit_file}"
+
+    cat > "$unit_file" <<EOF
+[Unit]
+Description=cgg-vless Quick Tunnel (trycloudflare)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${CFDD_BIN} tunnel --no-autoupdate --url http://127.0.0.1:${LOCAL_PORT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$unit_file"
+
+    systemctl daemon-reload
+    systemctl enable "${QUICK_SERVICE}" >/dev/null 2>&1 || warn "设置开机自启失败"
+    systemctl restart "${QUICK_SERVICE}"
+    log "临时隧道服务已启动，等待分配域名（最长约 60 秒）..."
+
+    local i url=""
+    for i in $(seq 1 30); do
+        url="$(quick_tunnel_url)"
+        [[ -n "$url" ]] && break
+        sleep 2
+    done
+
+    if [[ -z "$url" ]]; then
+        err "未获取到临时隧道域名，最近日志如下："
+        journalctl -u "$QUICK_SERVICE" -n 20 --no-pager >&2 || true
+        die "请根据日志排查后重试"
+    fi
+
+    TUNNEL_DOMAIN="${url#https://}"
+    save_info
+    log "临时隧道域名：${TUNNEL_DOMAIN}"
+}
+
 # ------------------------------ 配置合并 --------------------------------------
 # 把本模式生成的完整配置合并进现有 config.json：
 # 同 tag 的 inbound 替换，其他 inbound 原样保留，避免覆盖已安装的其他节点
@@ -651,11 +1012,10 @@ write_config() {
     local new_cfg
     new_cfg="$(mktemp)"
 
-    local listen_addr="0.0.0.0"
-    local listen_port="$LISTEN_PORT"
-    local tls_block=$'\n        "tlsSettings": {\n          "alpn": [\n            "h2",\n            "http/1.1"\n          ],\n          "certificates": [\n            {\n              "certificateFile": "'"$CERT_DIR"$'/fullchain.pem",\n              "keyFile": "'"$CERT_DIR"$'/privkey.pem"\n            }\n          ]\n        },'
-
-    cat > "$new_cfg" <<EOF
+    if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
+        # 隧道模式：Xray 仅监听 127.0.0.1，明文 HTTP 回源，TLS 由 Cloudflare 边缘承担
+        # XHTTP 固定 packet-up（stream-one 需 CF 开启 gRPC，临时隧道不支持）
+        cat > "$new_cfg" <<EOF
 {
   "log": {
     "loglevel": "warning",
@@ -664,7 +1024,64 @@ write_config() {
   },
   "inbounds": [
     {
-      "tag": "vless-xhttp-tls",
+      "tag": "${NODE_TAG}",
+      "listen": "127.0.0.1",
+      "port": ${LOCAL_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${UUID}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+          "path": "${WS_PATH}",
+          "mode": "packet-up"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
+}
+EOF
+    else
+        local listen_addr="0.0.0.0"
+        local listen_port="$LISTEN_PORT"
+        local tls_block=$'\n        "tlsSettings": {\n          "alpn": [\n            "h2",\n            "http/1.1"\n          ],\n          "certificates": [\n            {\n              "certificateFile": "'"$CERT_DIR"$'/fullchain.pem",\n              "keyFile": "'"$CERT_DIR"$'/privkey.pem"\n            }\n          ]\n        },'
+
+        cat > "$new_cfg" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "${LOG_DIR}/access.log",
+    "error": "${LOG_DIR}/error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "${NODE_TAG}",
       "listen": "${listen_addr}",
       "port": ${listen_port},
       "protocol": "vless",
@@ -707,6 +1124,7 @@ write_config() {
   ]
 }
 EOF
+    fi
 
     merge_config "$new_cfg"
     rm -f "$new_cfg"
@@ -717,14 +1135,28 @@ EOF
 # 保存节点元信息，供管理菜单读取（名称、路径、部署方式等）
 save_info() {
     install -d -m 755 -o root -g root "$NODES_DIR"
-    {
-        printf 'MODE=xhttp\n'
-        printf 'PORT=%s\n' "$LISTEN_PORT"
-        printf 'UUID=%s\n' "$UUID"
-        printf 'DOMAIN=%s\n' "$DOMAIN"
-        printf 'XHTTP_PATH=%s\n' "$WS_PATH"
-        printf 'NODE_NAME=%s\n' "$NODE_NAME"
-    } > "$NODE_INFO"
+    if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
+        {
+            printf 'MODE=xhttp-tunnel\n'
+            printf 'TUNNEL_TYPE=%s\n' "$TUNNEL_TYPE"
+            printf 'TUNNEL_REUSE=%s\n' "$TUNNEL_REUSE"
+            printf 'LOCAL_PORT=%s\n' "$LOCAL_PORT"
+            printf 'UUID=%s\n' "$UUID"
+            printf 'XHTTP_PATH=%s\n' "$WS_PATH"
+            printf 'XHTTP_MODE=packet-up\n'
+            printf 'TUNNEL_DOMAIN=%s\n' "$TUNNEL_DOMAIN"
+            printf 'NODE_NAME=%s\n' "$NODE_NAME"
+        } > "$NODE_INFO"
+    else
+        {
+            printf 'MODE=xhttp\n'
+            printf 'PORT=%s\n' "$LISTEN_PORT"
+            printf 'UUID=%s\n' "$UUID"
+            printf 'DOMAIN=%s\n' "$DOMAIN"
+            printf 'XHTTP_PATH=%s\n' "$WS_PATH"
+            printf 'NODE_NAME=%s\n' "$NODE_NAME"
+        } > "$NODE_INFO"
+    fi
     chmod 600 "$NODE_INFO"
 
     # 兼容旧版管理菜单：继续写共享元信息文件
@@ -825,6 +1257,58 @@ get_public_ip() {
 # ------------------------------ 结果输出 --------------------------------------
 print_result() {
     local link ip enc_path
+
+    # 隧道模式：地址为隧道域名，端口固定 443，TLS 由 Cloudflare 边缘处理
+    if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
+        if [[ -z "$TUNNEL_DOMAIN" ]]; then
+            warn "尚未记录隧道域名，链接中域名为占位符，配置好后请在总菜单 7 中重新查看"
+            TUNNEL_DOMAIN="YOUR_TUNNEL_DOMAIN"
+        fi
+        enc_path="$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')"
+        link="vless://${UUID}@${TUNNEL_DOMAIN}:443?encryption=none&security=tls&sni=${TUNNEL_DOMAIN}&fp=chrome&type=xhttp&host=${TUNNEL_DOMAIN}&path=${enc_path}&mode=packet-up#${NODE_NAME}"
+
+        local tunnel_label
+        if [[ "$TUNNEL_TYPE" == "quick" ]]; then
+            tunnel_label="临时隧道（trycloudflare）"
+        elif [[ "$TUNNEL_REUSE" == "1" ]]; then
+            tunnel_label="固定隧道（复用已有隧道）"
+        else
+            tunnel_label="固定隧道（新建独立隧道）"
+        fi
+
+        printf '\n%s========== cgg-vless XHTTP + CF Tunnel 节点信息 ==========%s\n' "$C_CYAN" "$C_RESET"
+        printf '  节点名称    : %s\n' "$NODE_NAME"
+        printf '  隧道类型    : %s\n' "$tunnel_label"
+        printf '  隧道域名    : %s\n' "$TUNNEL_DOMAIN"
+        printf '  客户端端口  : 443（TLS 由 Cloudflare 边缘处理）\n'
+        printf '  UUID        : %s\n' "$UUID"
+        printf '  传输协议    : xhttp\n'
+        printf '  XHTTP 路径  : %s\n' "$WS_PATH"
+        printf '  XHTTP 模式  : packet-up\n'
+        printf '  本地回源    : 127.0.0.1:%s\n' "$LOCAL_PORT"
+        printf '  SNI         : %s\n' "$TUNNEL_DOMAIN"
+        printf '%s============================================================%s\n\n' "$C_CYAN" "$C_RESET"
+
+        if [[ "$TUNNEL_TYPE" == "quick" ]]; then
+            printf '%s临时隧道：域名每次重启都会变化，总菜单 7 重新查看可获取最新域名；仅建议测试使用。%s\n' "$C_YELLOW" "$C_RESET"
+        else
+            printf '%s固定隧道：如尚未在网页端配置，请按上方提示添加 Public Hostname（Type: HTTP → URL: http://localhost:%s，需带 http:// 协议头）。%s\n' "$C_YELLOW" "$LOCAL_PORT" "$C_RESET"
+        fi
+        printf '%s防火墙无需放行任何入站端口，Xray 仅监听 127.0.0.1。%s\n\n' "$C_YELLOW" "$C_RESET"
+
+        printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
+
+        printf '%s服务管理：systemctl {status|restart|stop} xray%s\n' "$C_CYAN" "$C_RESET"
+        if [[ "$TUNNEL_TYPE" == "quick" ]]; then
+            printf '%s隧道服务：%s（日志：journalctl -u %s -n 50）%s\n\n' "$C_CYAN" "$QUICK_SERVICE" "$QUICK_SERVICE" "$C_RESET"
+        elif [[ "$TUNNEL_REUSE" == "1" ]]; then
+            printf '%s隧道服务：systemctl status cloudflared（复用模式，脚本未改动该服务）%s\n\n' "$C_CYAN" "$C_RESET"
+        else
+            printf '%s隧道服务：systemctl status cloudflared%s\n\n' "$C_CYAN" "$C_RESET"
+        fi
+        return 0
+    fi
+
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
     enc_path="$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')"
 
@@ -884,6 +1368,37 @@ main() {
     install_deps
     check_network
 
+    ask_deploy_mode
+
+    # ---------------------- Cloudflare Tunnel 部署 ----------------------
+    if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
+        # 切换为隧道专用 tag 与元信息文件，避免覆盖直连 / CDN 节点
+        NODE_TAG="$NODE_TAG_TUNNEL"
+        NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
+
+        ask_node_name
+        ask_tunnel_type
+        ask_local_port
+
+        ensure_xray
+        gen_uuid
+        gen_ws_path
+        write_config
+        write_service
+        start_service
+
+        ensure_cloudflared
+        if [[ "$TUNNEL_TYPE" == "quick" ]]; then
+            setup_quick_tunnel
+        else
+            setup_fixed_tunnel
+        fi
+
+        print_result
+        return 0
+    fi
+
+    # ---------------------- 直连 / CDN 部署 ----------------------
     ask_domain
     ask_email
     ask_node_name

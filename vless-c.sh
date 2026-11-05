@@ -19,6 +19,7 @@ readonly TAG_REALITY="vless-reality"
 readonly TAG_WS="vless-ws-tls"
 readonly TAG_TUNNEL="vless-ws-tunnel"
 readonly TAG_XHTTP="vless-xhttp-tls"
+readonly TAG_XHTTP_TUNNEL="vless-xhttp-tunnel"
 readonly CERT_DIR="${CONFIG_DIR}/cert"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
@@ -209,6 +210,7 @@ read_node_value() {
         "$TAG_WS")      mode="ws" ;;
         "$TAG_TUNNEL")  mode="tunnel" ;;
         "$TAG_XHTTP")   mode="xhttp" ;;
+        "$TAG_XHTTP_TUNNEL") mode="xhttp-tunnel" ;;
         *) return 1 ;;
     esac
     if [[ -f "$INFO_FILE" ]] && [[ "$(detect_mode)" == "$mode" ]]; then
@@ -241,6 +243,7 @@ tag_desc() {
         "$TAG_WS")      printf 'VLESS + WS + TLS' ;;
         "$TAG_TUNNEL")  printf 'VLESS + WS + CF Tunnel' ;;
         "$TAG_XHTTP")   printf 'VLESS + XHTTP + TLS' ;;
+        "$TAG_XHTTP_TUNNEL") printf 'VLESS + XHTTP + CF Tunnel' ;;
         *)              printf '%s' "$1" ;;
     esac
 }
@@ -248,7 +251,7 @@ tag_desc() {
 # 列出已安装的 Xray 节点 tag（固定顺序）
 xray_node_tags() {
     local t
-    for t in "$TAG_REALITY" "$TAG_WS" "$TAG_TUNNEL" "$TAG_XHTTP"; do
+    for t in "$TAG_REALITY" "$TAG_WS" "$TAG_TUNNEL" "$TAG_XHTTP" "$TAG_XHTTP_TUNNEL"; do
         if inbound_exists "$t"; then
             printf '%s\n' "$t"
         fi
@@ -292,6 +295,10 @@ detect_mode() {
         printf 'xhttp'
         return 0
     fi
+    if inbound_exists "$TAG_XHTTP_TUNNEL"; then
+        printf 'xhttp-tunnel'
+        return 0
+    fi
 
     # 兼容旧版无 tag 配置
     local sec net
@@ -306,6 +313,8 @@ detect_mode() {
         printf 'tunnel'
     elif [[ "$sec" == "tls" && "$net" == "xhttp" ]]; then
         printf 'xhttp'
+    elif [[ "$sec" == "none" && "$net" == "xhttp" ]]; then
+        printf 'xhttp-tunnel'
     else
         printf 'unknown'
     fi
@@ -340,6 +349,7 @@ migrate_legacy_config() {
         tls:ws)     tag="$TAG_WS" ;;
         none:ws)    tag="$TAG_TUNNEL" ;;
         tls:xhttp)  tag="$TAG_XHTTP" ;;
+        none:xhttp) tag="$TAG_XHTTP_TUNNEL" ;;
         *) return 0 ;;
     esac
 
@@ -448,6 +458,15 @@ install_xhttp() {
         local ans
         read -r -p "确认覆盖？[y/N]：" ans
         case "$ans" in
+            [Yy]*) ;;
+            *) warn "已取消"; return 1 ;;
+        esac
+    fi
+    if inbound_exists "$TAG_XHTTP_TUNNEL"; then
+        warn "已安装 XHTTP+CF Tunnel 节点，继续安装将覆盖该节点（其他节点不受影响）"
+        local ans2
+        read -r -p "确认覆盖？[y/N]：" ans2
+        case "$ans2" in
             [Yy]*) ;;
             *) warn "已取消"; return 1 ;;
         esac
@@ -677,6 +696,72 @@ show_info_xhttp() {
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
 }
 
+# XHTTP 隧道模式（VLESS + XHTTP + CF Tunnel）节点信息
+show_info_xhttp_tunnel() {
+    local port uuid path mode domain link node_name ttype latest enc_path
+    if ! inbound_exists "$TAG_XHTTP_TUNNEL"; then
+        err "未找到 XHTTP + CF Tunnel 节点配置"
+        return 1
+    fi
+    port="$(inbound_get "$TAG_XHTTP_TUNNEL" '.port')"
+    uuid="$(inbound_get "$TAG_XHTTP_TUNNEL" '.settings.clients[0].id')"
+    path="$(inbound_get "$TAG_XHTTP_TUNNEL" '.streamSettings.xhttpSettings.path')"
+    mode="$(inbound_get "$TAG_XHTTP_TUNNEL" '.streamSettings.xhttpSettings.mode')"
+    [[ -n "$mode" ]] || mode="packet-up"
+
+    if [[ -z "$port" || -z "$uuid" || -z "$path" ]]; then
+        err "配置读取不完整，无法生成链接"
+        return 1
+    fi
+
+    ttype="$(read_node_value "$TAG_XHTTP_TUNNEL" TUNNEL_TYPE || true)"
+    node_name="$(read_node_value "$TAG_XHTTP_TUNNEL" NODE_NAME || true)"
+    [[ -n "$node_name" ]] || node_name="cgg-vless-xhttp"
+    domain="$(read_node_value "$TAG_XHTTP_TUNNEL" TUNNEL_DOMAIN || true)"
+
+    # 临时隧道重启后域名会变化，优先读取服务日志中的最新域名
+    if [[ "$ttype" == "quick" ]]; then
+        latest="$(journalctl -u cgg-quick-tunnel --no-pager -n 200 2>/dev/null \
+            | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
+        if [[ -n "$latest" && "${latest#https://}" != "$domain" ]]; then
+            domain="${latest#https://}"
+            if ! write_node_value "$TAG_XHTTP_TUNNEL" TUNNEL_DOMAIN "$domain"; then
+                update_info_value TUNNEL_DOMAIN "$domain"
+            fi
+            warn "临时隧道域名已更新，客户端请重新获取"
+        fi
+    fi
+
+    if [[ -z "$domain" ]]; then
+        warn "尚未记录隧道域名，请在 Cloudflare 网页端完成 Public Hostname 配置"
+        domain="YOUR_TUNNEL_DOMAIN"
+    fi
+
+    enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
+    link="vless://${uuid}@${domain}:443?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}#${node_name}"
+
+    printf '\n%s======== cgg-vless XHTTP + CF Tunnel 节点 ========%s\n' "$C_CYAN" "$C_RESET"
+    printf '  模式        : VLESS + XHTTP + CF Tunnel\n'
+    printf '  隧道类型    : %s\n' "$([[ "$ttype" == "quick" ]] && printf '临时隧道（trycloudflare）' || printf '固定隧道')"
+    printf '  节点名称    : %s\n' "$node_name"
+    printf '  隧道域名    : %s\n' "$domain"
+    printf '  端口        : 443（TLS 由 Cloudflare 边缘处理）\n'
+    printf '  UUID        : %s\n' "$uuid"
+    printf '  XHTTP 路径  : %s\n' "$path"
+    printf '  XHTTP 模式  : %s\n' "$mode"
+    printf '  本地回源    : 127.0.0.1:%s\n' "$port"
+    printf '  SNI         : %s\n' "$domain"
+    printf '%s====================================================%s\n\n' "$C_CYAN" "$C_RESET"
+
+    if [[ "$ttype" == "quick" ]]; then
+        printf '%s临时隧道：域名每次重启都会变化，重新查看可获取最新域名；仅建议测试使用。%s\n\n' "$C_YELLOW" "$C_RESET"
+    else
+        printf '%s固定隧道：网页端 Public Hostname 需指向 http://localhost:%s%s\n\n' "$C_YELLOW" "$port" "$C_RESET"
+    fi
+
+    printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
+}
+
 # 隧道模式（VLESS + WS + CF Tunnel）节点信息
 show_info_tunnel() {
     local port uuid path domain link node_name ttype latest enc_path
@@ -860,6 +945,12 @@ show_info() {
         fi
     fi
 
+    if inbound_exists "$TAG_XHTTP_TUNNEL"; then
+        if show_info_xhttp_tunnel; then
+            shown=1
+        fi
+    fi
+
     if (( shown == 1 )); then
         if systemctl is-active --quiet xray 2>/dev/null; then
             log "Xray 服务状态：运行中"
@@ -874,7 +965,7 @@ show_info() {
                 # 已无 Xray 节点，继续展示 AnyTLS / Hysteria 2
                 ;;
             unknown)
-                err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel / XHTTP+TLS）"
+                err "无法识别当前配置模式（仅支持 Reality / WS+TLS / CF Tunnel / XHTTP+TLS / XHTTP+CF Tunnel）"
                 ;;
             *)
                 err "未找到有效配置"
@@ -931,10 +1022,10 @@ service_action() {
 
     sleep 1
 
-    # Cloudflare Tunnel 服务仅在存在 WS Tunnel 节点时联动
-    # 固定：cloudflared；临时：cgg-quick-tunnel（WS）
+    # Cloudflare Tunnel 服务仅在存在 WS / XHTTP Tunnel 节点时联动
+    # 固定：cloudflared；临时：cgg-quick-tunnel（WS / XHTTP）
     local has_tunnel=0
-    if inbound_exists "$TAG_TUNNEL"; then
+    if inbound_exists "$TAG_TUNNEL" || inbound_exists "$TAG_XHTTP_TUNNEL"; then
         has_tunnel=1
     fi
     if (( has_xray == 1 )) && (( has_tunnel == 1 )); then
@@ -1194,6 +1285,10 @@ change_node_name() {
             current="$(read_node_value "$TAG_XHTTP" NODE_NAME || true)"
             [[ -n "$current" ]] || current="cgg-vless-xhttp"
             ;;
+        "$TAG_XHTTP_TUNNEL")
+            current="$(read_node_value "$TAG_XHTTP_TUNNEL" NODE_NAME || true)"
+            [[ -n "$current" ]] || current="cgg-vless-xhttp"
+            ;;
         *)
             err "未找到有效配置，请先执行安装"
             return 1
@@ -1225,6 +1320,9 @@ change_node_name() {
             ;;
         "$TAG_XHTTP")
             show_info_xhttp
+            ;;
+        "$TAG_XHTTP_TUNNEL")
+            show_info_xhttp_tunnel
             ;;
         *)
             show_info_ws
@@ -1772,8 +1870,8 @@ remove_xray_node() {
     rm -f "$(node_info_file "$tag")"
     log "已从配置中移除节点：$(tag_desc "$tag")"
 
-    # CF Tunnel 节点需同时清理隧道服务
-    if [[ "$tag" == "$TAG_TUNNEL" ]]; then
+    # CF Tunnel 节点（WS / XHTTP）需同时清理隧道服务
+    if [[ "$tag" == "$TAG_TUNNEL" || "$tag" == "$TAG_XHTTP_TUNNEL" ]]; then
         remove_tunnel_service
     fi
 
@@ -2664,7 +2762,7 @@ show_menu() {
     printf '  %-2s %s\n' "3"  "安装 VLESS + WS 隧道节点（CF Tunnel 固定/临时）"
     printf '  %-2s %s\n' "4"  "安装 AnyTLS + TLS 节点（sing-box 后端）"
     printf '  %-2s %s\n' "5"  "安装 Hysteria 2 节点（sing-box 后端）"
-    printf '  %-2s %s\n' "6"  "安装 VLESS + XHTTP + TLS 节点（CDN）"
+    printf '  %-2s %s\n' "6"  "安装 VLESS + XHTTP 节点（直连/CDN 或 CF Tunnel）"
     printf '  %-2s %s\n' "7"  "查看当前节点配置与连接链接"
     printf '  %-2s %s\n' "8"  "启动 Xray 服务"
     printf '  %-2s %s\n' "9"  "停止 Xray 服务"

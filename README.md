@@ -92,9 +92,11 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 安装前会检测 UDP 端口占用，安装后自动放行 UDP 端口并校验监听状态；进程异常退出由 systemd `Restart=on-failure` 自动重连。完成后输出 `hysteria2://` 链接；NAT 机需在服务商面板把 **UDP** 外部端口映射到相同内部端口。
 
 
-## VLESS + XHTTP + TLS 模式（总菜单第 6 项）
+## VLESS + XHTTP 模式（总菜单第 6 项）
 
-基于 Xray-core 的 XHTTP 传输层，配置、服务与元信息与其他 Xray 节点并存；仅新增 `inbounds` 条目，不影响已安装节点。
+基于 Xray-core 的 XHTTP 传输层，配置、服务与元信息与其他 Xray 节点并存；仅新增 `inbounds` 条目，不影响已安装节点。安装时先选部署方式：直连 / CDN 或 Cloudflare Tunnel。
+
+### 直连 / CDN（tag: `vless-xhttp-tls`）
 
 | 项目 | 说明 |
 |---|---|
@@ -106,6 +108,19 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 | CDN | 支持 Cloudflare CDN，要求 Full (strict) |
 
 安装完成后输出 `type=xhttp` 分享链接。若 Xray 配置校验提示不支持 xhttp，请先在总菜单第 `18` 项执行核心更新。
+
+### Cloudflare Tunnel（tag: `vless-xhttp-tunnel`）
+
+Xray 仅监听 `127.0.0.1` 本地端口（默认 8002），`security: none`，TLS 由 Cloudflare 边缘承担，无需域名证书与入站端口。隧道类型与 WS 隧道一致：固定隧道（新建 / 复用，Token 注册 `cloudflared` 服务，网页 Public Hostname 的 Type 选 **HTTP**、URL 填 `http://localhost:本地端口`）或临时隧道（`cloudflared --url`，随机 `trycloudflare.com` 域名，重启变化）。
+
+| 项目 | 说明 |
+|---|---|
+| XHTTP 模式 | 固定 `packet-up`（`stream-one` 需 CF 开启 gRPC，临时隧道不支持） |
+| 客户端端口 | 443，链接 `type=xhttp&mode=packet-up&security=tls` |
+| 防火墙 | 无需放行任何入站端口 |
+| 隧道服务 | 与 WS 隧道共用 `cloudflared` / `cgg-quick-tunnel`，两类临时隧道不能同时各跑一个 |
+
+> 客户端需为支持 XHTTP 的 Xray 内核（v2rayN / v2rayNG 等）；sing-box 系客户端不支持 XHTTP。部署后建议用真实客户端验证连通性。
 
 
 
