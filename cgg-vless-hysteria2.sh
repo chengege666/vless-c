@@ -311,55 +311,85 @@ install_singbox() {
         return 0
     fi
 
-    local arch tag url digest asset ver tmpdir extracted actual
+    local arch tag url digest asset ver tmpdir extracted actual flat ans
+    local api_ok=1
     if ! arch="$(detect_arch)"; then
         die "当前架构不支持自动安装（仅支持 x86_64 / aarch64），请手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
     fi
 
     log "获取 sing-box 最新版本..."
     tmpdir="$(mk_tmpdir)"
+    tag=""; url=""; digest=""
     if ! curl -fsSL --retry 3 --connect-timeout 15 \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
         -o "${tmpdir}/release.json"; then
-        rm -rf "$tmpdir"
-        die "获取 sing-box 版本信息失败（GitHub API 不可达），可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        # API 不可达时，通过 releases/latest 的重定向地址解析最新版本号
+        warn "GitHub API 请求失败，尝试通过重定向解析最新版本..."
+        api_ok=0
+        tag="$(curl -fsSLI -o /dev/null --max-time 15 \
+            -w '%{url_effective}' \
+            https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null \
+            | sed 's#.*/tag/##' || true)"
+        if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            rm -rf "$tmpdir"
+            die "获取 sing-box 版本信息失败（GitHub API 与重定向均不可达），可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        fi
     fi
 
-    # 解析 tag / 下载地址 / 官方 sha256 digest：优先 jq，其次 python3
-    tag=""; url=""; digest=""
-    asset="sing-box-TBD-linux-${arch}.tar.gz"
-    if command -v jq >/dev/null 2>&1; then
-        tag="$(jq -r '.tag_name // empty' "${tmpdir}/release.json" 2>/dev/null || true)"
-    elif command -v python3 >/dev/null 2>&1; then
-        tag="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("tag_name",""))' "${tmpdir}/release.json" 2>/dev/null || true)"
-    else
-        tag="$(grep -o '"tag_name":"[^"]*"' "${tmpdir}/release.json" 2>/dev/null | head -n 1 | sed 's/.*:"//;s/"$//' || true)"
-    fi
-    if [[ -z "$tag" ]]; then
-        rm -rf "$tmpdir"
-        die "解析 sing-box 版本信息失败（GitHub API 返回异常），可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+    # 解析 tag：优先 jq / python3；正则回退时 GitHub API 可能返回带缩进的多行 JSON，
+    # 需先压平为单行再匹配，并容忍冒号两侧空格
+    if (( api_ok == 1 )); then
+        if command -v jq >/dev/null 2>&1; then
+            tag="$(jq -r '.tag_name // empty' "${tmpdir}/release.json" 2>/dev/null || true)"
+        elif command -v python3 >/dev/null 2>&1; then
+            tag="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("tag_name",""))' "${tmpdir}/release.json" 2>/dev/null || true)"
+        fi
+        if [[ -z "$tag" ]]; then
+            flat="$(tr -d '[:space:]' < "${tmpdir}/release.json" 2>/dev/null || true)"
+            tag="$(printf '%s' "$flat" \
+                | grep -o '"tag_name":"[^"]*"' | head -n 1 | sed 's/.*:"//;s/"$//' || true)"
+        fi
+        if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            local snippet
+            snippet="$(head -c 160 "${tmpdir}/release.json" 2>/dev/null | tr -d '\r\n' || true)"
+            rm -rf "$tmpdir"
+            die "解析 sing-box 版本信息失败（GitHub API 返回异常，响应开头：${snippet:-空响应}），可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        fi
     fi
 
     ver="${tag#v}"
     asset="sing-box-${ver}-linux-${arch}.tar.gz"
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
 
-    # digest 仅 jq / python3 可稳定解析（assets 数组嵌套对象）
-    if command -v jq >/dev/null 2>&1; then
-        digest="$(jq -r --arg n "$asset" '.assets[]?|select(.name==$n)|.digest // empty' "${tmpdir}/release.json" 2>/dev/null || true)"
-    elif command -v python3 >/dev/null 2>&1; then
-        digest="$(python3 -c 'import json,sys
+    # digest 解析：jq / python3 优先；正则回退用压平后的单行 + grep -P 非贪婪匹配
+    if (( api_ok == 1 )); then
+        if command -v jq >/dev/null 2>&1; then
+            digest="$(jq -r --arg n "$asset" '.assets[]?|select(.name==$n)|.digest // empty' "${tmpdir}/release.json" 2>/dev/null || true)"
+        elif command -v python3 >/dev/null 2>&1; then
+            digest="$(python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
 for a in d.get("assets",[]):
     if a.get("name")==sys.argv[2]:
         print(a.get("digest") or "");break' "${tmpdir}/release.json" "$asset" 2>/dev/null || true)"
+        else
+            flat="${flat:-$(tr -d '[:space:]' < "${tmpdir}/release.json" 2>/dev/null || true)}"
+            digest="$(printf '%s' "$flat" \
+                | grep -oP "\"name\":\"$asset\".{0,3000}?\"digest\":\"sha256:[0-9a-f]+\"" 2>/dev/null \
+                | grep -o 'sha256:[0-9a-f]*' | head -n 1 || true)"
+        fi
+        digest="${digest#sha256:}"
     fi
-    digest="${digest#sha256:}"
 
+    # 无法获得官方摘要时必须显式征得用户同意，不得静默跳过完整性校验
     if [[ -z "$digest" ]]; then
-        rm -rf "$tmpdir"
-        die "无法从 GitHub API 获取 ${asset} 的官方 SHA256 摘要（缺少 jq/python3 或 API 未返回 digest），为保证下载完整性拒绝继续。请安装 jq（apt-get install -y jq）或手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
+        warn "无法从 GitHub API 获取 ${asset} 的官方 SHA256 摘要"
+        warn "跳过完整性校验存在下载文件被篡改的风险"
+        read -r -p "是否在不进行 SHA256 校验的情况下继续下载？[y/N]：" ans
+        if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+            rm -rf "$tmpdir"
+            die "用户取消：请安装 jq（apt-get install -y jq）后重跑，或手动下载 sing-box 放到 ${SINGBOX_BIN}"
+        fi
     fi
 
     log "下载 sing-box：${url}"
@@ -368,13 +398,17 @@ for a in d.get("assets",[]):
         die "sing-box 下载失败，可手动下载 sing-box 放到 ${SINGBOX_BIN} 后重跑"
     fi
 
-    # 官方 SHA256 完整性校验
-    actual="$(sha256sum "${tmpdir}/${asset}" | awk '{print $1}')"
-    if [[ "${actual,,}" != "${digest,,}" ]]; then
-        rm -rf "$tmpdir"
-        die "sing-box 下载文件 SHA256 校验不通过（期望 ${digest}，实际 ${actual}），已拒绝安装"
+    # 官方 SHA256 完整性校验（仅在取得官方摘要时执行）
+    if [[ -n "$digest" ]]; then
+        actual="$(sha256sum "${tmpdir}/${asset}" | awk '{print $1}')"
+        if [[ "${actual,,}" != "${digest,,}" ]]; then
+            rm -rf "$tmpdir"
+            die "sing-box 下载文件 SHA256 校验不通过（期望 ${digest}，实际 ${actual}），已拒绝安装"
+        fi
+        log "SHA256 校验通过"
+    else
+        warn "已按用户确认跳过 SHA256 校验"
     fi
-    log "SHA256 校验通过"
 
     if ! tar -xzf "${tmpdir}/${asset}" -C "$tmpdir"; then
         rm -rf "$tmpdir"
