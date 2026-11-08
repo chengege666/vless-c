@@ -938,6 +938,7 @@ Restart=on-failure
 RestartSec=2
 TimeoutStartSec=30
 LimitNOFILE=1000000
+OOMScoreAdjust=-600
 
 [Install]
 WantedBy=multi-user.target
