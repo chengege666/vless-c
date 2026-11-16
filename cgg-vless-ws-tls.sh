@@ -90,14 +90,23 @@ check_os() {
     [[ -r /etc/os-release ]] || die "无法读取 /etc/os-release，无法识别系统版本"
     # shellcheck disable=SC1091
     . /etc/os-release
+    local min=""
     case "${ID:-}" in
-        ubuntu|debian)
-            log "当前系统：${PRETTY_NAME:-${ID}}"
-            ;;
+        ubuntu) min="20.04" ;;
+        debian) min="11" ;;
         *)
-            die "仅支持 Ubuntu / Debian，当前系统：${PRETTY_NAME:-unknown}"
+            die "仅支持 Ubuntu 20.04+ / Debian 11+，当前系统：${PRETTY_NAME:-unknown}"
             ;;
     esac
+
+    # 版本号缺失时只告警，避免精简镜像 / LXC 模板被误拦
+    if [[ -z "${VERSION_ID:-}" ]]; then
+        warn "无法读取系统版本号，跳过版本检查：${PRETTY_NAME:-${ID}}"
+    elif [[ "$(printf '%s\n%s\n' "$min" "${VERSION_ID}" | sort -V | head -n 1)" != "$min" ]]; then
+        die "系统版本过低：需要 ${ID} ${min} 及以上，当前为 ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
+    fi
+
+    log "当前系统：${PRETTY_NAME:-${ID} ${VERSION_ID}}"
 }
 
 detect_runtime_user() {
@@ -759,6 +768,7 @@ Restart=on-failure
 RestartPreventExitStatus=23
 LimitNPROC=10000
 LimitNOFILE=1000000
+OOMScoreAdjust=-600
 
 [Install]
 WantedBy=multi-user.target

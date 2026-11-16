@@ -1,0 +1,73 @@
+name: Lint Shell Scripts
+
+# 提交 / PR 时对全部 .sh 做静态检查：
+#   - bash -n     语法错误（阻塞）
+#   - CRLF 换行   会导致 Linux 下报 bad interpreter（阻塞）
+#   - shebang     缺失则无法直接执行（阻塞）
+#   - shellcheck  目前只提示 error 级、不阻塞；存量问题清理干净后，
+#                 把 shellcheck 任务里的 continue-on-error 去掉即可转为强制
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    name: 语法 / 换行 / shebang
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检查 shell 脚本
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+
+          for f in *.sh; do
+            [ -e "$f" ] || continue
+
+            if ! bash -n "$f"; then
+              echo "::error file=$f::bash 语法检查失败"
+              fail=1
+            fi
+
+            if grep -qU $'\r' "$f"; then
+              echo "::error file=$f::包含 CRLF 换行，Linux 下执行会报 bad interpreter"
+              fail=1
+            fi
+
+            if [ "$(head -c 2 "$f")" != "#!" ]; then
+              echo "::error file=$f::缺少 shebang，无法直接执行"
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -eq 0 ]; then
+            echo "全部脚本检查通过"
+          fi
+          exit "$fail"
+
+  shellcheck:
+    name: shellcheck（error 级，暂不阻塞）
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装并运行 shellcheck
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error --format=gcc *.sh
+
+      - name: 说明
+        if: always()
+        run: echo "shellcheck 当前为提示性质，不阻塞合并；存量 error 清理后可移除 continue-on-error。"

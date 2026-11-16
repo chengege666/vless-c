@@ -3,7 +3,8 @@
 # cgg-vless · 总菜单入口
 # 适用系统：Ubuntu 20.04+ / Debian 11+
 # 用    法：sudo bash vless-c.sh
-# 说    明：统一入口，调用同目录下的三个子脚本；
+# 说    明：统一入口，调用同目录下的六个子脚本（reality / ws-tls / tunnel /
+#           anytls / hysteria2 / xhttp）；
 #           若通过 curl 远程运行，会自动下载子脚本到 /opt/cgg-vless 再执行
 # ==============================================================================
 set -euo pipefail
@@ -108,14 +109,23 @@ check_os() {
     [[ -r /etc/os-release ]] || die "无法读取 /etc/os-release，无法识别系统版本"
     # shellcheck disable=SC1091
     . /etc/os-release
+    local min=""
     case "${ID:-}" in
-        ubuntu|debian)
-            log "当前系统：${PRETTY_NAME:-${ID}}"
-            ;;
+        ubuntu) min="20.04" ;;
+        debian) min="11" ;;
         *)
-            die "仅支持 Ubuntu / Debian，当前系统：${PRETTY_NAME:-unknown}"
+            die "仅支持 Ubuntu 20.04+ / Debian 11+，当前系统：${PRETTY_NAME:-unknown}"
             ;;
     esac
+
+    # 版本号缺失时只告警，避免精简镜像 / LXC 模板被误拦
+    if [[ -z "${VERSION_ID:-}" ]]; then
+        warn "无法读取系统版本号，跳过版本检查：${PRETTY_NAME:-${ID}}"
+    elif [[ "$(printf '%s\n%s\n' "$min" "${VERSION_ID}" | sort -V | head -n 1)" != "$min" ]]; then
+        die "系统版本过低：需要 ${ID} ${min} 及以上，当前为 ${PRETTY_NAME:-${ID} ${VERSION_ID}}"
+    fi
+
+    log "当前系统：${PRETTY_NAME:-${ID} ${VERSION_ID}}"
 }
 
 # ------------------------------ 子脚本定位 ------------------------------------
@@ -156,6 +166,29 @@ get_child_script() {
 
     # 去除可能存在的 Windows 换行符
     sed -i 's/\r$//' "$tmp" 2>/dev/null || true
+
+    # 下载后基本完整性校验：挡住截断文件、CDN/代理返回的 HTML 错误页、
+    # 以及被替换成非脚本内容的情况（不替代签名校验，但能避免直接执行垃圾数据）
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        err "子脚本内容为空：${name}"
+        return 1
+    fi
+
+    local first_line
+    first_line="$(head -n 1 "$tmp" 2>/dev/null | cut -c1-60)"
+    if [[ ! "$first_line" =~ ^#!.*(bash|sh) ]]; then
+        rm -f "$tmp"
+        err "子脚本缺少 shell 头（首行：${first_line}），已拒绝执行"
+        return 1
+    fi
+
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        err "子脚本语法校验失败：${name}（下载可能不完整）"
+        return 1
+    fi
+
     mv "$tmp" "$dst"
     chmod 755 "$dst"
 
@@ -1714,9 +1747,25 @@ uninstall_acme() {
         rm -rf "${ACME_HOME:?}" || warn "删除 ${ACME_HOME} 失败，请手动清理"
     fi
 
-    # 安全清理可能残留的 cron 续期任务
+    # 安全清理指向「本 acme.sh 实例」的 cron 续期任务
+    # 注意：不能用 grep -v 'acme.sh' 过滤关键字——那样会连带删掉本机上
+    # 其它 acme.sh 实例（其它站点）的续期任务，导致对方证书静默停止续期
     if command -v crontab >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -v 'acme.sh' | crontab - 2>/dev/null || true
+        local cur filtered
+        cur="$(crontab -l 2>/dev/null || true)"
+        if [[ -n "$cur" ]]; then
+            filtered="$(printf '%s\n' "$cur" | grep -vF -- "$ACME_HOME" || true)"
+            if [[ "$filtered" == "$cur" ]]; then
+                log "未发现指向 ${ACME_HOME} 的续期任务，其它 cron 任务未改动"
+            elif [[ -z "$filtered" ]]; then
+                crontab -r 2>/dev/null || warn "清理续期任务失败，请手动执行 crontab -e"
+                log "已清空 crontab（其中仅含 ${ACME_HOME} 的续期任务）"
+            else
+                printf '%s\n' "$filtered" | crontab - 2>/dev/null \
+                    || warn "清理续期任务失败，请手动执行 crontab -e"
+                log "已移除 ${ACME_HOME} 的续期任务，其它 cron 任务已保留"
+            fi
+        fi
     fi
 
     if [[ ! -d "$ACME_HOME" ]]; then
