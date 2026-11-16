@@ -168,6 +168,34 @@ check_memory_headroom() {
     fi
 }
 
+# ------------------------------ 监听地址 --------------------------------------
+# 0.0.0.0 只创建 IPv4 socket，IPv6 客户端连不进来；:: 在 bindv6only=0 时是双栈。
+# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4，
+# 所以不写死，按内核实际能力探测。
+detect_listen_addr() {
+    local dis b6
+    dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
+    b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)"
+    if [[ "$dis" == "0" && "$b6" == "0" ]]; then
+        printf '::'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
+LISTEN_ADDR="$(detect_listen_addr 2>/dev/null || true)"
+[[ -n "$LISTEN_ADDR" ]] || LISTEN_ADDR="0.0.0.0"
+
+# IPv6 地址在 URI 里必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
+format_host() {
+    local h="$1"
+    if [[ "$h" == *:* && "$h" != \[* ]]; then
+        printf '[%s]' "$h"
+    else
+        printf '%s' "$h"
+    fi
+}
+
 # ------------------------------ 终端横幅 --------------------------------------
 show_banner() {
     printf '%s' "$C_CYAN"
@@ -1222,7 +1250,7 @@ write_config() {
 }
 EOF
     else
-        local listen_addr="0.0.0.0"
+        local listen_addr="$LISTEN_ADDR"
         local listen_port="$LISTEN_PORT"
         local tls_block=$'\n        "tlsSettings": {\n          "alpn": [\n            "h2",\n            "http/1.1"\n          ],\n          "certificates": [\n            {\n              "certificateFile": "'"$CERT_DIR"$'/fullchain.pem",\n              "keyFile": "'"$CERT_DIR"$'/privkey.pem"\n            }\n          ]\n        },'
 
@@ -1378,6 +1406,18 @@ configure_firewall() {
         return 0
     fi
 
+    # ufw 的 allow 默认同时覆盖 v4/v6；iptables 只作用于 IPv4，IPv6 需单独放行
+    if command -v ip6tables >/dev/null 2>&1; then
+        local p6
+        for p6 in "$LISTEN_PORT" 80; do
+            if ! ip6tables -C INPUT -p tcp --dport "$p6" -j ACCEPT 2>/dev/null; then
+                ip6tables -I INPUT -p tcp --dport "$p6" -j ACCEPT \
+                    || warn "ip6tables 放行 ${p6}/tcp 失败，请手动放行"
+            fi
+        done
+        log "ip6tables 已放行 ${LISTEN_PORT}/tcp 与 80/tcp"
+    fi
+
     if command -v iptables >/dev/null 2>&1; then
         local p
         for p in "$LISTEN_PORT" 80; do
@@ -1474,7 +1514,7 @@ print_result() {
     fi
 
     # CDN / 直连模式：地址默认输出源站 IP，套 CDN 时客户端改用优选域名/IP
-    link="vless://${UUID}@${ip}:${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=${enc_path}&mode=auto&alpn=h2#${NODE_NAME}"
+    link="vless://${UUID}@$(format_host "$ip"):${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=${enc_path}&mode=auto&alpn=h2#${NODE_NAME}"
 
     printf '\n%s============== cgg-vless XHTTP+TLS 节点信息 ==============%s\n' "$C_CYAN" "$C_RESET"
     printf '  节点名称    : %s\n' "$NODE_NAME"

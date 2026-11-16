@@ -185,6 +185,34 @@ check_memory_headroom() {
     fi
 }
 
+# ------------------------------ 监听地址 --------------------------------------
+# 0.0.0.0 只创建 IPv4 socket，IPv6 客户端连不进来；:: 在 bindv6only=0 时是双栈。
+# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4，
+# 所以不写死，按内核实际能力探测。
+detect_listen_addr() {
+    local dis b6
+    dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
+    b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)"
+    if [[ "$dis" == "0" && "$b6" == "0" ]]; then
+        printf '::'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
+LISTEN_ADDR="$(detect_listen_addr 2>/dev/null || true)"
+[[ -n "$LISTEN_ADDR" ]] || LISTEN_ADDR="0.0.0.0"
+
+# IPv6 地址在 URI 里必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
+format_host() {
+    local h="$1"
+    if [[ "$h" == *:* && "$h" != \[* ]]; then
+        printf '[%s]' "$h"
+    else
+        printf '%s' "$h"
+    fi
+}
+
 trap 'warn "收到中断信号，正在清理..."; exit 130' INT TERM
 trap on_exit EXIT
 
@@ -278,6 +306,13 @@ is_private_ipv4() {
     return 1
 }
 
+is_ipv6() {
+    local ip="$1"
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [[ "$ip" == *:*:* ]]
+}
+
 # 仅接受严格 IPv4 格式且为公网地址的结果，杜绝 IPv6 / 内网误判
 get_public_ip() {
     local ip="" src
@@ -289,6 +324,15 @@ get_public_ip() {
     do
         ip="$(curl -fsS4 --max-time 6 "$src" 2>/dev/null | tr -d '[:space:]' || true)"
         if is_ipv4 "$ip" && ! is_private_ipv4 "$ip"; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    # 没有公网 IPv4 时退回 IPv6（纯 IPv6 机器）
+    for src in "https://ipv6.icanhazip.com" "https://api6.ipify.org"; do
+        ip="$(curl -fsS6 --max-time 6 "$src" 2>/dev/null | tr -d '[:space:]' || true)"
+        if is_ipv6 "$ip"; then
+            warn "未取到公网 IPv4，使用 IPv6 地址：${ip}（客户端需支持 IPv6）"
             printf '%s' "$ip"
             return 0
         fi
@@ -305,8 +349,11 @@ ask_server_addr() {
     fi
     warn "无法自动确认公网 IPv4 地址"
     while true; do
-        read -r -p "请手动输入公网 IPv4 或域名（回车 = 使用占位符 YOUR_SERVER_IP，稍后自行替换）：" input
+        read -r -p "请手动输入公网 IPv4 / IPv6 或域名（回车 = 使用占位符 YOUR_SERVER_IP，稍后自行替换）：" input
         input="${input//[[:space:]]/}"
+        # 允许直接粘贴带方括号的 IPv6（[2401:db8::1]）
+        input="${input#\[}"
+        input="${input%\]}"
         if [[ -z "$input" ]]; then
             SERVER_IP="YOUR_SERVER_IP"
             IP_UNCONFIRMED=1
@@ -317,7 +364,7 @@ ask_server_addr() {
             warn "${input} 是内网/保留地址，不能作为公网分享地址"
             continue
         fi
-        if is_ipv4 "$input" || validate_domain "$input"; then
+        if is_ipv4 "$input" || is_ipv6 "$input" || validate_domain "$input"; then
             SERVER_IP="$input"
             IP_UNCONFIRMED=1
             log "使用手动填写的地址：${SERVER_IP}（未经自动确认）"
@@ -922,7 +969,7 @@ write_config() {
     {
       "type": "hysteria2",
       "tag": "hysteria2-in",
-      "listen": "0.0.0.0",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT},
       "users": [
         {
@@ -1119,6 +1166,19 @@ configure_firewall() {
         fi
     fi
 
+    # iptables 只作用于 IPv4；IPv6 需要单独的 ip6tables 规则（ufw 的 allow 已同时覆盖 v4/v6）
+    if (( ufw_active == 0 )) && command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables -C INPUT -p udp --dport "$PORT" -m comment --comment "$FW_COMMENT" -j ACCEPT 2>/dev/null; then
+            log "ip6tables 已存在端口规则，跳过：${PORT}/udp"
+        elif ip6tables -I INPUT -p udp --dport "$PORT" -m comment --comment "$FW_COMMENT" -j ACCEPT 2>/dev/null; then
+            log "ip6tables 已放行端口 ${PORT}/udp"
+        elif ip6tables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+            warn "ip6tables comment 模块不可用，已添加无注释规则：${PORT}/udp"
+        else
+            warn "ip6tables 放行端口失败，请手动放行 ${PORT}/udp"
+        fi
+    fi
+
     if command -v iptables >/dev/null 2>&1; then
         # 优先带注释标记；个别内核缺 comment 模块时退化为无注释规则
         if iptables -C INPUT -p udp --dport "$PORT" -m comment --comment "$FW_COMMENT" -j ACCEPT 2>/dev/null; then
@@ -1152,7 +1212,7 @@ configure_firewall() {
 # ------------------------------ 端口跳跃 --------------------------------------
 # 主端口不变，用 nat REDIRECT 把跳跃端口（UDP）转发到主端口。
 # 说明：REDIRECT 对 UDP/QUIC 目的地址转换有效（官方 hy2 服务端跳跃同理），
-#       但 sing-box 仅监听 IPv4（0.0.0.0），跳跃规则只覆盖 IPv4；IPv6 客户端
+#       跳跃规则只覆盖 IPv4（未加 ip6tables 的对应 REDIRECT），IPv6 客户端
 #       需直连主端口。非特权 LXC/OpenVZ 容器通常无 nat 表权限，将明确报错。
 hop_backend() {
     if command -v iptables >/dev/null 2>&1 && iptables -t nat -S PREROUTING >/dev/null 2>&1; then
@@ -1362,7 +1422,7 @@ print_result() {
     local ip link pin portspec host
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
 
-    # IPv6 地址在 URI 中必须加方括号（本服务仅监听 IPv4，正常不会出现）
+    # IPv6 地址在 URI 中必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
     if [[ "$ip" == *:* ]]; then
         host="[${ip}]"
     else

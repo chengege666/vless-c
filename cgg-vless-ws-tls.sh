@@ -149,6 +149,34 @@ check_memory_headroom() {
     fi
 }
 
+# ------------------------------ 监听地址 --------------------------------------
+# 0.0.0.0 只创建 IPv4 socket，IPv6 客户端连不进来；:: 在 bindv6only=0 时是双栈。
+# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4，
+# 所以不写死，按内核实际能力探测。
+detect_listen_addr() {
+    local dis b6
+    dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
+    b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)"
+    if [[ "$dis" == "0" && "$b6" == "0" ]]; then
+        printf '::'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
+LISTEN_ADDR="$(detect_listen_addr 2>/dev/null || true)"
+[[ -n "$LISTEN_ADDR" ]] || LISTEN_ADDR="0.0.0.0"
+
+# IPv6 地址在 URI 里必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
+format_host() {
+    local h="$1"
+    if [[ "$h" == *:* && "$h" != \[* ]]; then
+        printf '[%s]' "$h"
+    else
+        printf '%s' "$h"
+    fi
+}
+
 # ------------------------------ 终端横幅 --------------------------------------
 show_banner() {
     printf '%s' "$C_CYAN"
@@ -813,7 +841,7 @@ write_config() {
   "inbounds": [
     {
       "tag": "vless-ws-tls",
-      "listen": "0.0.0.0",
+      "listen": "${LISTEN_ADDR}",
       "port": ${LISTEN_PORT},
       "protocol": "vless",
       "settings": {
@@ -947,6 +975,18 @@ configure_firewall() {
         return 0
     fi
 
+    # ufw 的 allow 默认同时覆盖 v4/v6；iptables 只作用于 IPv4，IPv6 需单独放行
+    if command -v ip6tables >/dev/null 2>&1; then
+        local p6
+        for p6 in "$LISTEN_PORT" 80; do
+            if ! ip6tables -C INPUT -p tcp --dport "$p6" -j ACCEPT 2>/dev/null; then
+                ip6tables -I INPUT -p tcp --dport "$p6" -j ACCEPT \
+                    || warn "ip6tables 放行 ${p6}/tcp 失败，请手动放行"
+            fi
+        done
+        log "ip6tables 已放行 ${LISTEN_PORT}/tcp 与 80/tcp"
+    fi
+
     if command -v iptables >/dev/null 2>&1; then
         local p
         for p in "$LISTEN_PORT" 80; do
@@ -965,12 +1005,21 @@ configure_firewall() {
 # ------------------------------ 公网 IP ---------------------------------------
 get_public_ip() {
     local ip=""
+    # IPv4 优先：双栈机器上客户端大多只有 IPv4，v4 地址兼容性最好
     ip="$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
     if [[ -z "$ip" ]]; then
         ip="$(curl -fsS4 --max-time 5 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
     fi
+    # 没有 IPv4 出口（纯 IPv6 机器）时退回 IPv6
     if [[ -z "$ip" ]]; then
-        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+        ip="$(curl -fsS6 --max-time 5 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "$ip" ]]; then
+            warn "未取到公网 IPv4，使用 IPv6 地址：${ip}（客户端需支持 IPv6）"
+        fi
+    fi
+    if [[ -z "$ip" ]]; then
+        # 排除链路本地 fe80、ULA fc00::/7、回环，避免把内网地址写进分享链接
+        ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(fe80|fc[0-9a-fA-F]{2}|fd[0-9a-fA-F]{2}|127\.)' | head -n 1 || true)"
         if [[ -n "$ip" ]]; then
             warn "公网 IP 获取失败，使用本机 IP：${ip}（如在 NAT 后请手动替换）"
         fi
@@ -990,7 +1039,7 @@ print_result() {
     fi
 
     # CDN 场景下地址应填 CDN 优选域名/IP，此处默认输出源站 IP
-    link="vless://${UUID}@${ip}:${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')#${NODE_NAME}"
+    link="vless://${UUID}@$(format_host "$ip"):${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')#${NODE_NAME}"
 
     printf '\n%s=============== cgg-vless WS+TLS 节点信息 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  节点名称    : %s\n' "$NODE_NAME"

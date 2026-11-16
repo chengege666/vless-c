@@ -169,6 +169,34 @@ check_memory_headroom() {
     fi
 }
 
+# ------------------------------ 监听地址 --------------------------------------
+# 0.0.0.0 只创建 IPv4 socket，IPv6 客户端连不进来；:: 在 bindv6only=0 时是双栈。
+# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4，
+# 所以不写死，按内核实际能力探测。
+detect_listen_addr() {
+    local dis b6
+    dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
+    b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)"
+    if [[ "$dis" == "0" && "$b6" == "0" ]]; then
+        printf '::'
+    else
+        printf '0.0.0.0'
+    fi
+}
+
+LISTEN_ADDR="$(detect_listen_addr 2>/dev/null || true)"
+[[ -n "$LISTEN_ADDR" ]] || LISTEN_ADDR="0.0.0.0"
+
+# IPv6 地址在 URI 里必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
+format_host() {
+    local h="$1"
+    if [[ "$h" == *:* && "$h" != \[* ]]; then
+        printf '[%s]' "$h"
+    else
+        printf '%s' "$h"
+    fi
+}
+
 # ------------------------------ 终端横幅 --------------------------------------
 show_banner() {
     printf '%s' "$C_CYAN"
@@ -509,12 +537,24 @@ migrate_legacy_config() {
 # ------------------------------ 公网 IP ---------------------------------------
 get_public_ip() {
     local ip=""
+    # IPv4 优先：双栈机器上客户端大多只有 IPv4，v4 地址兼容性最好
     ip="$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
     if [[ -z "$ip" ]]; then
         ip="$(curl -fsS4 --max-time 5 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
     fi
+    # 没有 IPv4 出口（纯 IPv6 机器）时退回 IPv6
     if [[ -z "$ip" ]]; then
-        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+        ip="$(curl -fsS6 --max-time 5 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "$ip" ]]; then
+            warn "未取到公网 IPv4，使用 IPv6 地址：${ip}（客户端需支持 IPv6）"
+        fi
+    fi
+    if [[ -z "$ip" ]]; then
+        # 排除链路本地 fe80、ULA fc00::/7、回环，避免把内网地址写进分享链接
+        ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(fe80|fc[0-9a-fA-F]{2}|fd[0-9a-fA-F]{2}|127\.)' | head -n 1 || true)"
+        if [[ -n "$ip" ]]; then
+            warn "公网 IP 获取失败，使用本机 IP：${ip}（如在 NAT 后请手动替换）"
+        fi
     fi
     printf '%s' "$ip"
 }
@@ -688,7 +728,7 @@ show_info_reality() {
     local link ip node_name
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
     node_name="${R_NODE_NAME:-VLESS-Reality}"
-    link="vless://${R_UUID}@${ip}:${R_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${R_SNI}&fp=chrome&pbk=${R_PUBLIC_KEY}&sid=${R_SHORT_ID}&type=tcp&headerType=none#${node_name}"
+    link="vless://${R_UUID}@$(format_host "$ip"):${R_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${R_SNI}&fp=chrome&pbk=${R_PUBLIC_KEY}&sid=${R_SHORT_ID}&type=tcp&headerType=none#${node_name}"
 
     printf '\n%s=============== cgg-vless Reality 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + Reality\n'
@@ -750,7 +790,7 @@ show_info_ws() {
     enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
     node_name="$(read_node_value "$TAG_WS" NODE_NAME || true)"
     [[ -n "$node_name" ]] || node_name="cgg-vless-ws"
-    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#${node_name}"
+    link="vless://${uuid}@$(format_host "$ip"):${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#${node_name}"
 
     printf '\n%s============= cgg-vless WS + TLS 节点 =============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + WebSocket + TLS\n'
@@ -798,7 +838,7 @@ show_info_xhttp() {
     fi
 
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}&alpn=h2#${node_name}"
+    link="vless://${uuid}@$(format_host "$ip"):${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=xhttp&host=${domain}&path=${enc_path}&mode=${mode}&alpn=h2#${node_name}"
 
     printf '\n%s============ cgg-vless XHTTP + TLS 节点 ============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + XHTTP + TLS\n'
@@ -963,7 +1003,7 @@ show_info_anytls() {
     fi
 
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="anytls://${password}@${ip}:${port}?security=tls&sni=${domain}&fp=chrome#${node_name}"
+    link="anytls://${password}@$(format_host "$ip"):${port}?security=tls&sni=${domain}&fp=chrome#${node_name}"
 
     printf '\n%s================= cgg-vless AnyTLS 节点 =================%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : AnyTLS + TLS（sing-box）\n'
@@ -1003,7 +1043,7 @@ show_info_hysteria2() {
     fi
 
     ip="${SERVER_IP:-YOUR_SERVER_IP}"
-    link="hysteria2://${password}@${ip}:${port}/?sni=${domain}&alpn=h3#${node_name}"
+    link="hysteria2://${password}@$(format_host "$ip"):${port}/?sni=${domain}&alpn=h3#${node_name}"
 
     printf '\n%s=============== cgg-vless Hysteria 2 节点 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : Hysteria 2（sing-box，QUIC/UDP）\n'
