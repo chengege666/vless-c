@@ -8,7 +8,7 @@
 #   Cloudflare Tunnel：固定 / 临时隧道，Xray 仅监听 127.0.0.1（security: none），
 #     TLS 由 Cloudflare 边缘承担，无需域名证书与入站端口；隧道模式 XHTTP 固定 packet-up
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"

@@ -7,7 +7,7 @@
 #           anytls / hysteria2 / xhttp）；
 #           若通过 curl 远程运行，会自动下载子脚本到 /opt/cgg-vless 再执行
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
@@ -775,7 +775,8 @@ show_info_ws() {
     enc_path="$(printf '%s' "$path" | sed 's|/|%2F|g')"
     node_name="$(read_node_value "$TAG_WS" NODE_NAME || true)"
     [[ -n "$node_name" ]] || node_name="cgg-vless-ws"
-    link="vless://${uuid}@$(format_host "$ip"):${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}#${node_name}"
+    # alpn 与服务端 tlsSettings 一致（ws 只能跑 HTTP/1.1，避免套 CDN 时协商成 h2）
+    link="vless://${uuid}@$(format_host "$ip"):${port}?encryption=none&security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}&path=${enc_path}&alpn=http%2F1.1#${node_name}"
 
     printf '\n%s============= cgg-vless WS + TLS 节点 =============%s\n' "$C_CYAN" "$C_RESET"
     printf '  模式        : VLESS + WebSocket + TLS\n'

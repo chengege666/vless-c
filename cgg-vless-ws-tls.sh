@@ -5,7 +5,8 @@
 # 用    法：sudo bash cgg-vless-ws-tls.sh
 # 前    提：域名已解析到本机，且 80 端口可从公网访问（用于 acme.sh 验证）
 # ==============================================================================
-set -euo pipefail
+# -E：让 ERR trap 在函数 / 子 shell 内同样生效，否则失败时拿不到行号与退出码
+set -Eeuo pipefail
 
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
@@ -385,9 +386,21 @@ own_running_port() {
 # ------------------------------ 监听端口 --------------------------------------
 # 默认 443；NAT VPS 可选择服务商分配端口范围内的自定义端口
 ask_listen_port() {
-    [[ -t 0 ]] || { log "非交互模式：使用默认监听端口 ${LISTEN_PORT}"; return 0; }
-
     local choice input conflict
+
+    # 非交互模式无法选择端口，但端口冲突检测不能省：
+    # 否则默认 443 与其他节点撞车时，配置照样写入，Xray 启动失败
+    if [[ ! -t 0 ]]; then
+        log "非交互模式：使用默认监听端口 ${LISTEN_PORT}"
+        if port_in_use "$LISTEN_PORT" && ! own_running_port "$LISTEN_PORT"; then
+            die "端口 ${LISTEN_PORT} 已被占用，请交互式运行以选择其他端口"
+        fi
+        if conflict="$(port_config_conflict "$LISTEN_PORT" "$NODE_TAG")"; then
+            die "端口 ${LISTEN_PORT} 已被${conflict}占用，请交互式运行以选择其他端口"
+        fi
+        return 0
+    fi
+
     printf '\n选择监听端口模式：\n'
     printf '  1) 默认 443（普通 VPS 推荐）\n'
     printf '  2) 自定义端口（NAT VPS 受限端口范围）\n'
@@ -828,6 +841,9 @@ write_config() {
     fi
 
     # 先写入临时文件，再由 merge_config 合并进 config.json，保留其他节点
+    # 注意：tlsSettings 必须把 alpn 固定为 http/1.1。Xray 默认 ["h2","http/1.1"]，
+    # 套 Cloudflare 时 CF 回源 ClientHello 把 h2 排在前面，协商成 h2 后 WebSocket
+    # （只支持 HTTP/1.1）无法完成 Upgrade，客户端会看到 502 / 连接重置。
     local new_cfg
     new_cfg="$(mktemp)"
 
@@ -856,6 +872,9 @@ write_config() {
         "network": "ws",
         "security": "tls",
         "tlsSettings": {
+          "alpn": [
+            "http/1.1"
+          ],
           "certificates": [
             {
               "certificateFile": "${CERT_DIR}/fullchain.pem",
@@ -1039,7 +1058,8 @@ print_result() {
     fi
 
     # CDN 场景下地址应填 CDN 优选域名/IP，此处默认输出源站 IP
-    link="vless://${UUID}@$(format_host "$ip"):${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')#${NODE_NAME}"
+    # alpn 与服务端 tlsSettings 保持一致，避免客户端按默认 h2 协商
+    link="vless://${UUID}@$(format_host "$ip"):${LISTEN_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')&alpn=http%2F1.1#${NODE_NAME}"
 
     printf '\n%s=============== cgg-vless WS+TLS 节点信息 ===============%s\n' "$C_CYAN" "$C_RESET"
     printf '  节点名称    : %s\n' "$NODE_NAME"

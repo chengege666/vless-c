@@ -5,7 +5,7 @@
 # 用    法：sudo bash cgg-vless-reality.sh
 # 说    明：仅安装 VLESS + Reality，不包含 VMess / Trojan 等协议
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"

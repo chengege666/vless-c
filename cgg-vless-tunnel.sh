@@ -9,7 +9,7 @@
 #   固定隧道复用：沿用本机已有 cloudflared 服务，不重装、不清理
 #   临时隧道：quick tunnel（trycloudflare.com），域名随机且每次重启都会变化
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 # ------------------------------ 基础常量 --------------------------------------
 readonly XRAY_BIN="/usr/local/bin/xray"
