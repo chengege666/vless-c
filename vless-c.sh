@@ -169,23 +169,8 @@ check_memory_headroom() {
     fi
 }
 
-# ------------------------------ 监听地址 --------------------------------------
-# 0.0.0.0 只创建 IPv4 socket，IPv6 客户端连不进来；:: 在 bindv6only=0 时是双栈。
-# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4，
-# 所以不写死，按内核实际能力探测。
-detect_listen_addr() {
-    local dis b6
-    dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
-    b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)"
-    if [[ "$dis" == "0" && "$b6" == "0" ]]; then
-        printf '::'
-    else
-        printf '0.0.0.0'
-    fi
-}
-
-LISTEN_ADDR="$(detect_listen_addr 2>/dev/null || true)"
-[[ -n "$LISTEN_ADDR" ]] || LISTEN_ADDR="0.0.0.0"
+# 监听地址由各子脚本自行按内核能力探测（子脚本里的 detect_listen_addr）。
+# 本脚本不写 xray / sing-box 配置，因此不需要这份逻辑。
 
 # IPv6 地址在 URI 里必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
 format_host() {

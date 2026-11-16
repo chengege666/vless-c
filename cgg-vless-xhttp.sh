@@ -1436,12 +1436,21 @@ configure_firewall() {
 # ------------------------------ 公网 IP ---------------------------------------
 get_public_ip() {
     local ip=""
+    # IPv4 优先：双栈机器上客户端大多只有 IPv4，v4 地址兼容性最好
     ip="$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
     if [[ -z "$ip" ]]; then
         ip="$(curl -fsS4 --max-time 5 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
     fi
+    # 没有 IPv4 出口（纯 IPv6 机器）时退回 IPv6
     if [[ -z "$ip" ]]; then
-        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+        ip="$(curl -fsS6 --max-time 5 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "$ip" ]]; then
+            warn "未取到公网 IPv4，使用 IPv6 地址：${ip}（客户端需支持 IPv6）"
+        fi
+    fi
+    if [[ -z "$ip" ]]; then
+        # 排除链路本地 fe80、ULA fc00::/7、回环，避免把内网地址写进分享链接
+        ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(fe80|fc[0-9a-fA-F]{2}|fd[0-9a-fA-F]{2}|127\.)' | head -n 1 || true)"
         if [[ -n "$ip" ]]; then
             warn "公网 IP 获取失败，使用本机 IP：${ip}（如在 NAT 后请手动替换）"
         fi

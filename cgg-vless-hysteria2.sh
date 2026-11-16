@@ -370,7 +370,7 @@ ask_server_addr() {
             log "使用手动填写的地址：${SERVER_IP}（未经自动确认）"
             return 0
         fi
-        warn "格式不合法（需为 IPv4 或域名）：${input}"
+        warn "格式不合法（需为 IPv4 / IPv6 或域名）：${input}"
     done
 }
 
