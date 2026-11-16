@@ -84,6 +84,91 @@ die()  { err "$*"; exit 1; }
 
 trap 'err "操作失败（行号：$LINENO，退出码：$?）"' ERR
 
+# ------------------------------ 低内存适配 ------------------------------------
+# 低配 LXC / OpenVZ 容器常把 /tmp 挂成 tmpfs：解压出来的二进制直接计入内存而非
+# 磁盘，64/128MB 机器在 unzip 阶段就会被内核 OOM 杀掉。SIGKILL 无法被 trap 捕获，
+# 用户看到的只是"卡住"且没有任何报错。下面两步把硬占用内存降为可回收的 page cache。
+
+# 目录所在文件系统类型（tmpfs 即内存盘）
+fs_type() {
+    df -P -T "$1" 2>/dev/null | awk 'NR==2 {print $2}' || true
+}
+
+# 把临时目录固定到真实磁盘；Xray 官方安装器与 mktemp 都会继承 TMPDIR
+prepare_tmpdir() {
+    local cur="${TMPDIR:-/tmp}" cand
+    if [[ "$(fs_type "$cur")" != "tmpfs" ]]; then
+        export TMPDIR="$cur"
+        return 0
+    fi
+    for cand in /var/tmp /root/.cache /usr/local/etc/.cgg-tmp; do
+        mkdir -p "$cand" 2>/dev/null || continue
+        [[ "$(fs_type "$cand")" == "tmpfs" ]] && continue
+        export TMPDIR="$cand"
+        warn "检测到 ${cur} 为 tmpfs（内存盘），临时目录改用 ${cand}，避免解压时耗尽内存"
+        return 0
+    done
+    warn "未找到磁盘上的临时目录，仍使用 ${cur}；低内存机器可能在解压阶段失败"
+}
+
+# 内存偏小时尽力补一块 swap；容器不允许则只告警，不中断安装
+ensure_swap() {
+    local mem_kb swap_kb avail_mb size_mb=512
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ -z "$mem_kb" || "$mem_kb" -eq 0 || "$mem_kb" -ge 262144 ]]; then
+        return 0
+    fi
+    if [[ -n "$swap_kb" && "$swap_kb" -gt 0 ]]; then
+        return 0
+    fi
+    if [[ "${CGG_NO_SWAP:-0}" == "1" ]]; then
+        return 0
+    fi
+    avail_mb="$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+    if [[ -z "$avail_mb" || "$avail_mb" -lt 1024 ]]; then
+        warn "根分区剩余空间不足 1GB，跳过创建 swapfile"
+        return 0
+    fi
+
+    log "内存 ${mem_kb}KB 且未启用 swap，尝试创建 ${size_mb}MB swapfile..."
+    local created=0
+    if [[ ! -f /swapfile ]]; then
+        if ! fallocate -l "${size_mb}M" /swapfile 2>/dev/null; then
+            if ! dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none 2>/dev/null; then
+                rm -f /swapfile || true
+                warn "创建 swapfile 失败，跳过（CGG_NO_SWAP=1 可关闭此尝试）"
+                return 0
+            fi
+        fi
+        chmod 600 /swapfile 2>/dev/null || true
+        created=1
+    fi
+    if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
+        # 容器不允许 swap 时把本次新建的文件删掉，避免白占磁盘
+        if [[ "$created" == "1" ]]; then
+            rm -f /swapfile || true
+            warn "无法启用 swap（LXC / OpenVZ 容器通常不允许），已删除临时 swapfile，改由磁盘临时目录降低内存峰值"
+        else
+            warn "无法启用已有的 /swapfile（容器通常不允许 swap，已跳过）"
+        fi
+        return 0
+    fi
+    grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null \
+        || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+    log "swap 已启用：${size_mb}MB（已写入 /etc/fstab）"
+}
+
+# 安装前提示内存余量，避免在必然失败的情况下白等
+check_memory_headroom() {
+    local avail_kb
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ -n "$avail_kb" && "$avail_kb" -gt 0 && "$avail_kb" -lt 32768 ]]; then
+        warn "当前可用内存仅 $(( avail_kb / 1024 ))MB，安装过程仍可能失败"
+        warn "建议先停止无关服务释放内存，或换用内存更大的机器"
+    fi
+}
+
 # ------------------------------ 终端横幅 --------------------------------------
 show_banner() {
     printf '%s' "$C_CYAN"
@@ -2833,6 +2918,9 @@ main_menu() {
     require_root
     show_banner
     check_os
+    prepare_tmpdir
+    ensure_swap
+    check_memory_headroom
     resolve_script_dir
     migrate_legacy_config || true
 

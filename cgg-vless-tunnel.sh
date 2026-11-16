@@ -24,7 +24,6 @@ readonly NODE_INFO="${NODES_DIR}/${NODE_TAG}.info"
 readonly ANYTLS_CONFIG="/usr/local/etc/sing-box/config.json"
 readonly SERVICE_FILE="/etc/systemd/system/xray.service"
 readonly LOG_DIR="/var/log/xray"
-readonly INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 readonly CFDD_BIN="/usr/local/bin/cloudflared"
 readonly CFDD_URL_BASE="https://github.com/cloudflare/cloudflared/releases/latest/download"
 readonly CFDD_CONFIG_FILE="/etc/cloudflared/config.yml"
@@ -70,6 +69,91 @@ err()  { printf '%s[ERROR]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 trap 'err "脚本执行失败（行号：$LINENO，退出码：$?），请根据上方日志排查"' ERR
+
+# ------------------------------ 低内存适配 ------------------------------------
+# 低配 LXC / OpenVZ 容器常把 /tmp 挂成 tmpfs：解压出来的二进制直接计入内存而非
+# 磁盘，64/128MB 机器在 unzip 阶段就会被内核 OOM 杀掉。SIGKILL 无法被 trap 捕获，
+# 用户看到的只是"卡住"且没有任何报错。下面两步把硬占用内存降为可回收的 page cache。
+
+# 目录所在文件系统类型（tmpfs 即内存盘）
+fs_type() {
+    df -P -T "$1" 2>/dev/null | awk 'NR==2 {print $2}' || true
+}
+
+# 把临时目录固定到真实磁盘；Xray 官方安装器与 mktemp 都会继承 TMPDIR
+prepare_tmpdir() {
+    local cur="${TMPDIR:-/tmp}" cand
+    if [[ "$(fs_type "$cur")" != "tmpfs" ]]; then
+        export TMPDIR="$cur"
+        return 0
+    fi
+    for cand in /var/tmp /root/.cache /usr/local/etc/.cgg-tmp; do
+        mkdir -p "$cand" 2>/dev/null || continue
+        [[ "$(fs_type "$cand")" == "tmpfs" ]] && continue
+        export TMPDIR="$cand"
+        warn "检测到 ${cur} 为 tmpfs（内存盘），临时目录改用 ${cand}，避免解压时耗尽内存"
+        return 0
+    done
+    warn "未找到磁盘上的临时目录，仍使用 ${cur}；低内存机器可能在解压阶段失败"
+}
+
+# 内存偏小时尽力补一块 swap；容器不允许则只告警，不中断安装
+ensure_swap() {
+    local mem_kb swap_kb avail_mb size_mb=512
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ -z "$mem_kb" || "$mem_kb" -eq 0 || "$mem_kb" -ge 262144 ]]; then
+        return 0
+    fi
+    if [[ -n "$swap_kb" && "$swap_kb" -gt 0 ]]; then
+        return 0
+    fi
+    if [[ "${CGG_NO_SWAP:-0}" == "1" ]]; then
+        return 0
+    fi
+    avail_mb="$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
+    if [[ -z "$avail_mb" || "$avail_mb" -lt 1024 ]]; then
+        warn "根分区剩余空间不足 1GB，跳过创建 swapfile"
+        return 0
+    fi
+
+    log "内存 ${mem_kb}KB 且未启用 swap，尝试创建 ${size_mb}MB swapfile..."
+    local created=0
+    if [[ ! -f /swapfile ]]; then
+        if ! fallocate -l "${size_mb}M" /swapfile 2>/dev/null; then
+            if ! dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=none 2>/dev/null; then
+                rm -f /swapfile || true
+                warn "创建 swapfile 失败，跳过（CGG_NO_SWAP=1 可关闭此尝试）"
+                return 0
+            fi
+        fi
+        chmod 600 /swapfile 2>/dev/null || true
+        created=1
+    fi
+    if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
+        # 容器不允许 swap 时把本次新建的文件删掉，避免白占磁盘
+        if [[ "$created" == "1" ]]; then
+            rm -f /swapfile || true
+            warn "无法启用 swap（LXC / OpenVZ 容器通常不允许），已删除临时 swapfile，改由磁盘临时目录降低内存峰值"
+        else
+            warn "无法启用已有的 /swapfile（容器通常不允许 swap，已跳过）"
+        fi
+        return 0
+    fi
+    grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null \
+        || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+    log "swap 已启用：${size_mb}MB（已写入 /etc/fstab）"
+}
+
+# 安装前提示内存余量，避免在必然失败的情况下白等
+check_memory_headroom() {
+    local avail_kb
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ -n "$avail_kb" && "$avail_kb" -gt 0 && "$avail_kb" -lt 32768 ]]; then
+        warn "当前可用内存仅 $(( avail_kb / 1024 ))MB，安装过程仍可能失败"
+        warn "建议先停止无关服务释放内存，或换用内存更大的机器"
+    fi
+}
 
 # ------------------------------ 终端横幅 --------------------------------------
 show_banner() {
@@ -130,7 +214,7 @@ install_deps() {
 
     local missing=()
     local cmd
-    for cmd in curl openssl jq; do
+    for cmd in curl openssl jq unzip; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     command -v ss >/dev/null 2>&1 || missing+=("iproute2")
@@ -316,21 +400,82 @@ ask_local_port() {
 # ------------------------------ 安装 Xray -------------------------------------
 ensure_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
-        log "检测到已安装 Xray：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
+        local cur cur_ver
+        cur="$("$XRAY_BIN" version 2>/dev/null | head -n 1 || true)"
+        log "检测到已安装 Xray：${cur}"
+        cur_ver="$(printf '%s' "$cur" | awk '{print $2}')"
+        if [[ -n "$cur_ver" ]] && [[ "$(printf '%s\n%s\n' "1.8.0" "$cur_ver" | sort -V | head -n 1)" != "1.8.0" ]]; then
+            warn "当前版本 ${cur_ver} 低于 1.8，Reality / xtls-rprx-vision 可能不可用，建议升级核心"
+        fi
         return 0
     fi
 
-    log "开始安装官方 Xray-core..."
-    local installer rc=0
-    installer="$(mktemp)"
-    if ! curl -fsSL --retry 3 --connect-timeout 15 -o "$installer" "$INSTALL_URL"; then
-        rm -f "$installer"
-        die "Xray 官方安装脚本下载失败，请检查网络"
+    command -v curl >/dev/null 2>&1 || die "缺少 curl，无法下载 Xray"
+    command -v unzip >/dev/null 2>&1 || die "缺少 unzip，请先安装：apt-get install -y unzip"
+
+    local arch tag url zip entry new_bin expect actual
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="64" ;;
+        aarch64|arm64) arch="arm64-v8a" ;;
+        armv7l|armv7)  arch="arm32-v7a" ;;
+        *) die "不支持的架构：$(uname -m)，请手动安装 ${XRAY_BIN} 后重跑" ;;
+    esac
+
+    log "获取 Xray 最新版本..."
+    tag="$(curl -fsSL --retry 3 --connect-timeout 15 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+    [[ -n "$tag" ]] || die "获取 Xray 版本失败（GitHub API 不可达），请手动安装 ${XRAY_BIN} 后重跑"
+
+    url="https://github.com/XTLS/Xray-core/releases/download/${tag}/Xray-linux-${arch}.zip"
+    zip="${TMPDIR:-/tmp}/Xray-linux-${arch}.zip"
+
+    log "下载 Xray ${tag}（linux-${arch}）..."
+    if ! curl -fsSL --retry 3 --connect-timeout 15 -o "$zip" "$url"; then
+        rm -f "$zip" || true
+        die "Xray 下载失败，请检查网络后重试"
     fi
-    bash "$installer" install || rc=$?
-    rm -f "$installer"
-    (( rc == 0 )) || die "Xray 安装失败（退出码 ${rc}）"
+
+    # 官方 .dgst 里带 SHA256；取不到时只告警（下载仍走 HTTPS），不阻断安装
+    expect="$(curl -fsSL --retry 2 --connect-timeout 15 "${url}.dgst" 2>/dev/null \
+        | awk -F '= ' '/256=/ {print $2}' | head -n 1 || true)"
+    if [[ -n "$expect" ]]; then
+        actual="$(sha256sum "$zip" | awk '{print $1}' | sed 's/^\\//')"
+        if [[ "$expect" != "$actual" ]]; then
+            rm -f "$zip" || true
+            die "Xray 校验失败（期望 ${expect}，实际 ${actual}），已拒绝安装"
+        fi
+        log "SHA256 校验通过"
+    else
+        warn "未取到官方校验文件，跳过 SHA256 校验"
+    fi
+
+    # 关键：流式解压直接写目标文件，不产生解压后的中间副本。
+    # 官方安装器会把压缩包和整棵解压目录都放在临时目录，/tmp 为 tmpfs 时
+    # 这几十 MB 全算内存占用，低内存机器会在这一步被 OOM 杀掉。
+    entry="$(unzip -Z1 "$zip" 2>/dev/null | grep -E '(^|/)xray$' | head -n 1 || true)"
+    if [[ -z "$entry" ]]; then
+        rm -f "$zip" || true
+        die "压缩包中未找到 xray 可执行文件"
+    fi
+    new_bin="${XRAY_BIN}.new"
+    if ! unzip -p "$zip" "$entry" > "$new_bin"; then
+        rm -f "$zip" "$new_bin"
+        die "Xray 解压失败（可能是磁盘空间不足）"
+    fi
+    if ! chmod 755 "$new_bin"; then
+        rm -f "$zip" "$new_bin"
+        die "设置执行权限失败"
+    fi
+    if ! mv -f "$new_bin" "$XRAY_BIN"; then
+        rm -f "$zip" "$new_bin"
+        die "替换 ${XRAY_BIN} 失败"
+    fi
+    rm -f "$zip" || true
+
     [[ -x "$XRAY_BIN" ]] || die "安装完成后未找到 ${XRAY_BIN}"
+    log "Xray 安装完成：$("$XRAY_BIN" version 2>/dev/null | head -n 1)"
 }
 
 # ------------------------------ 安装 cloudflared ------------------------------
@@ -816,6 +961,9 @@ main() {
     show_banner
     check_os
     detect_runtime_user
+    prepare_tmpdir
+    ensure_swap
+    check_memory_headroom
 
     install_deps
     check_network
