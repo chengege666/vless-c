@@ -207,9 +207,12 @@ check_network() {
     if ! curl -fsS --max-time 10 -o /dev/null https://github.com; then
         warn "GitHub 访问异常，sing-box 下载可能失败"
     fi
-    # 出口策略为 prefer_ipv4：本机没有 v4 出网时会全程回落 IPv6，提前告知
+    # 出口按接入地址族分流：任一族的出网不通，对应那条节点就会失效或回落
     if ! curl -fsS4 --max-time 5 -o /dev/null https://ipv4.icanhazip.com 2>/dev/null; then
-        warn "IPv4 出网不通，prefer_ipv4 将全部回落为 IPv6（节点仍可正常使用）"
+        warn "IPv4 出网不通：用 IPv4 地址接入的节点将无法出网"
+    fi
+    if ! curl -fsS6 --max-time 5 -o /dev/null https://ipv6.icanhazip.com 2>/dev/null; then
+        warn "IPv6 出网不通：用 IPv6 地址接入的节点会全部回落为 IPv4"
     fi
 }
 
@@ -504,11 +507,11 @@ write_config() {
         log "旧配置已备份：${backup}"
     fi
 
-    # 出口地址族策略：prefer_ipv4（两者都查，优先 A 记录，纯 IPv6 目标自动回落）。
-    # 不设策略时 direct 出站的行为随版本浮动，会把出口锁在单一地址族上。
+    # 出口按「接入地址族」分流：从 IPv4 连进来走 IPv4 出口，从 IPv6 连进来走 IPv6 出口。
+    # 服务端看不到客户端填的是什么地址，只能看到连接的源地址族，故用 route 的 source_ip_cidr 判定。
     # sing-box 1.12 起 outbound 的 domain_strategy 已弃用（1.14 移除），
     # 新版改用 domain_resolver + 命名 DNS 服务器表达，故按实际版本二选一生成。
-    local sb_ver sb_major=1 sb_minor=11 dns_block direct_block
+    local sb_ver sb_major=1 sb_minor=11 dns_block outbounds_block
     sb_ver="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 \
         | grep -oE '[0-9]+\.[0-9]+' | head -n 1 || true)"
     if [[ -n "$sb_ver" ]]; then
@@ -526,20 +529,41 @@ write_config() {
       }
     ]
   },'
-        direct_block='      "type": "direct",
-      "tag": "direct",
+        outbounds_block='      "type": "direct",
+      "tag": "direct-v4",
       "domain_resolver": {
         "server": "local",
-        "strategy": "prefer_ipv4"
+        "strategy": "ipv4_only"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct-v6",
+      "domain_resolver": {
+        "server": "local",
+        "strategy": "prefer_ipv6"
       }'
     else
         log "sing-box ${sb_major}.${sb_minor}：出口策略使用 domain_strategy"
         dns_block=''
-        direct_block='      "type": "direct",
-      "tag": "direct",
-      "domain_strategy": "prefer_ipv4"'
+        outbounds_block='      "type": "direct",
+      "tag": "direct-v4",
+      "domain_strategy": "ipv4_only"
+    },
+    {
+      "type": "direct",
+      "tag": "direct-v6",
+      "domain_strategy": "prefer_ipv6"'
     fi
 
+    # 分流依赖双栈监听：绑 0.0.0.0 时 IPv6 连接根本进不来，分流不会生效
+    if [[ "$LISTEN_ADDR" != "::" ]]; then
+        warn "监听地址为 ${LISTEN_ADDR}，IPv6 连接无法接入，按地址族分流不会生效"
+    fi
+
+    # route 规则顺序不能乱：双栈 socket 上 IPv4 连接的源地址可能是 v4-mapped 形式
+    # （::ffff:a.b.c.d），会被 ::/0 命中，所以必须先拦 ::ffff:0:0/96 再拦 ::/0。
+    # 未命中任何规则时 sing-box 落到第一个出站，即 direct-v4。
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
@@ -569,9 +593,16 @@ ${dns_block}
   ],
   "outbounds": [
     {
-${direct_block}
+${outbounds_block}
     }
-  ]
+  ],
+  "route": {
+    "rules": [
+      { "source_ip_cidr": ["::ffff:0:0/96"], "outbound": "direct-v4" },
+      { "source_ip_cidr": ["0.0.0.0/0"], "outbound": "direct-v4" },
+      { "source_ip_cidr": ["::/0"], "outbound": "direct-v6" }
+    ]
+  }
 }
 EOF
 
@@ -702,7 +733,7 @@ print_result() {
     printf '%s提示：%s\n' "$C_YELLOW" "$C_RESET"
     printf '  - 客户端需支持 AnyTLS：sing-box 系客户端直接支持；v2rayN 需切换到 sing-box 内核\n'
     printf '  - AnyTLS 为原始 TCP + TLS，无法套 Cloudflare CDN，需客户端直连\n'
-    printf '  - 出口策略：prefer_ipv4（优先 IPv4，纯 IPv6 目标自动回落 IPv6）\n'
+    printf '  - 出口分流：IPv4 地址接入走 IPv4 出口，IPv6 地址接入走 IPv6 出口\n'
     printf '  - NAT 机器需在服务商面板把外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
     if [[ "$CERT_MODE" == "selfsigned" ]]; then
         printf '  - 当前为自签证书，客户端必须开启「跳过证书验证 / allowInsecure」\n'
