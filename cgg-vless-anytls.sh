@@ -207,6 +207,10 @@ check_network() {
     if ! curl -fsS --max-time 10 -o /dev/null https://github.com; then
         warn "GitHub 访问异常，sing-box 下载可能失败"
     fi
+    # 出口策略为 prefer_ipv6：本机没有 v6 出网时会全程回落 IPv4，提前告知
+    if ! curl -fsS6 --max-time 5 -o /dev/null https://ipv6.icanhazip.com 2>/dev/null; then
+        warn "IPv6 出网不通，prefer_ipv6 将全部回落为 IPv4（节点仍可正常使用）"
+    fi
 }
 
 # 交互环境检查：本脚本必须交互输入域名与证书路径
@@ -500,12 +504,49 @@ write_config() {
         log "旧配置已备份：${backup}"
     fi
 
+    # 出口地址族策略：prefer_ipv6（两者都查，优先 AAAA，纯 IPv4 目标自动回落）。
+    # 不设策略时 direct 出站的行为随版本浮动，会把出口锁在单一地址族上。
+    # sing-box 1.12 起 outbound 的 domain_strategy 已弃用（1.14 移除），
+    # 新版改用 domain_resolver + 命名 DNS 服务器表达，故按实际版本二选一生成。
+    local sb_ver sb_major=1 sb_minor=11 dns_block direct_block
+    sb_ver="$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 \
+        | grep -oE '[0-9]+\.[0-9]+' | head -n 1 || true)"
+    if [[ -n "$sb_ver" ]]; then
+        sb_major="${sb_ver%%.*}"
+        sb_minor="${sb_ver#*.}"
+    fi
+
+    if (( sb_major > 1 || (sb_major == 1 && sb_minor >= 12) )); then
+        log "sing-box ${sb_major}.${sb_minor}+：出口策略使用 domain_resolver"
+        dns_block='  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "local"
+      }
+    ]
+  },'
+        direct_block='      "type": "direct",
+      "tag": "direct",
+      "domain_resolver": {
+        "server": "local",
+        "strategy": "prefer_ipv6"
+      }'
+    else
+        log "sing-box ${sb_major}.${sb_minor}：出口策略使用 domain_strategy"
+        dns_block=''
+        direct_block='      "type": "direct",
+      "tag": "direct",
+      "domain_strategy": "prefer_ipv6"'
+    fi
+
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
     "level": "warn",
     "timestamp": true
   },
+${dns_block}
   "inbounds": [
     {
       "type": "anytls",
@@ -528,8 +569,7 @@ write_config() {
   ],
   "outbounds": [
     {
-      "type": "direct",
-      "tag": "direct"
+${direct_block}
     }
   ]
 }
@@ -662,6 +702,7 @@ print_result() {
     printf '%s提示：%s\n' "$C_YELLOW" "$C_RESET"
     printf '  - 客户端需支持 AnyTLS：sing-box 系客户端直接支持；v2rayN 需切换到 sing-box 内核\n'
     printf '  - AnyTLS 为原始 TCP + TLS，无法套 Cloudflare CDN，需客户端直连\n'
+    printf '  - 出口策略：prefer_ipv6（优先 IPv6，纯 IPv4 目标自动回落 IPv4）\n'
     printf '  - NAT 机器需在服务商面板把外部端口 %s 映射到容器内部端口 %s\n' "$PORT" "$PORT"
     if [[ "$CERT_MODE" == "selfsigned" ]]; then
         printf '  - 当前为自签证书，客户端必须开启「跳过证书验证 / allowInsecure」\n'
