@@ -1,8 +1,8 @@
 # cgg-vless
 
-一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + XHTTP + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** / **Hysteria 2** / **Snell v6** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
+一键搭建 **VLESS + XTLS-Reality** / **VLESS + WebSocket + TLS** / **VLESS + XHTTP + TLS** / **VLESS + WS + Cloudflare Tunnel** / **AnyTLS + TLS** / **Hysteria 2** 节点的 Shell 脚本集合，适用于 Ubuntu 20.04+ 与 Debian 11+。
 
-VLESS 系列统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议；AnyTLS 与 Hysteria 2 因 Xray-core 不支持，使用独立 sing-box 后端；Snell v6 使用 Surge 官方 `snell-server` 二进制。
+VLESS 系列统一使用官方 Xray-core，仅配置 VLESS 协议，不包含 VMess / Trojan 等多余协议；AnyTLS 与 Hysteria 2 因 Xray-core 不支持，使用独立 sing-box 后端。
 
 ```
   ██████╗ ██████╗  ██████╗     ██╗   ██╗██╗     ███████╗███████╗███████╗
@@ -57,7 +57,7 @@ Xray 仅监听 `127.0.0.1` 的 WS 明文（`security: none`），TLS 由 Cloudfl
 
 固定隧道网页端配置：**Zero Trust → Networks → Tunnels → Public Hostname**，Type 选 **HTTP**，URL 填 `http://localhost:本地端口`（默认 8001，必须带 `http://` 协议头），保存后 DNS 记录自动创建。
 
-临时隧道域名重启后会变化，用总菜单第 `8` 项重新查看即可获取最新域名；仅建议测试使用。
+临时隧道域名重启后会变化，用总菜单第 `7` 项重新查看即可获取最新域名；仅建议测试使用。
 
 
 ## AnyTLS + TLS 模式（总菜单第 4 项）
@@ -107,7 +107,7 @@ Hysteria 2 基于 QUIC/UDP，Xray-core 不支持，该模式同样由脚本安�
 | 客户端 | 支持 XHTTP 的 Xray 内核（v2rayN / v2rayNG / sing-box 等较新版本） |
 | CDN | 支持 Cloudflare CDN，要求 Full (strict) |
 
-安装完成后输出 `type=xhttp` 分享链接。若 Xray 配置校验提示不支持 xhttp，请先在总菜单第 `19` 项执行核心更新。
+安装完成后输出 `type=xhttp` 分享链接。若 Xray 配置校验提示不支持 xhttp，请先在总菜单第 `18` 项执行核心更新。
 
 ### Cloudflare Tunnel（tag: `vless-xhttp-tunnel`）
 
@@ -123,22 +123,6 @@ Xray 仅监听 `127.0.0.1` 本地端口（默认 8002），`security: none`，TL
 > 客户端需为支持 XHTTP 的 Xray 内核（v2rayN / v2rayNG 等）；sing-box 系客户端不支持 XHTTP。部署后建议用真实客户端验证连通性。
 
 
-## Snell v6 模式（总菜单第 7 项）
-
-Snell 是 Surge 团队自研的闭源加密代理协议，Xray-core 与 sing-box 均无法替代其官方服务端，该模式安装 **官方 snell-server** 二进制；配置 `snell-server.conf`、服务 `cgg-snell`、元信息均与 Xray / sing-box 分离，可与现有节点并存。
-
-| 项目 | 说明 |
-|---|---|
-| 是否需要域名 | 不需要（无 TLS） |
-| 证书 | 不需要 |
-| 默认端口 | 6160/TCP（可自定义，NAT 机填映射范围内的端口） |
-| 传输 | 纯 TCP，流量特征由 PSK 派生 |
-| 流量模式 | `default` / `unshaped` / `unsafe-raw`，客户端与服务端必须一致 |
-| 客户端 | Surge（v6 Beta）、Stash、mihomo ≥ 1.19.34、sing-box ≥ 1.14.0 |
-| CDN | **不支持**套 Cloudflare CDN（非 HTTP/WS，无 TLS） |
-| 分享链接 | 无通用 URI，安装完成后输出 Surge / Stash / mihomo / sing-box 手动配置 |
-
-安装时自动生成 64 字符（32 字节）PSK。注意：Snell v6 仍处于 Beta，官方可能做不兼容变更；协议无前向保密、无专门防重放，抗主动探测弱于 Reality；v2rayNG / NekoBox / Hiddify 不支持 Snell。NAT 机需在服务商面板映射 **TCP** 端口。
 
 
 ## Cloudflare CDN 配置建议
@@ -178,7 +162,7 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
    - 监听端口在 Cloudflare 支持列表内（443 / 2053 / 2083 / 2087 / 2096 / 8443）→ 客户端直接用该端口连接，无需额外配置
    - 监听端口不在列表内 → 在 Cloudflare 的 **Origin Rules** 新建规则，将回源端口（Destination Port）改为监听端口，客户端端口填 443
 4. 证书申请：NAT 机通常没有 80 端口，HTTP-01 会失败，改用以下方式之一：
-   - DNS-01 验证（总菜单 `13` → `3`，支持 Cloudflare / 阿里云）
+   - DNS-01 验证（总菜单 `12` → `3`，支持 Cloudflare / 阿里云）
    - 使用本机已有证书文件（证书来源选 `2`，直接填 `.cer` / `.key` 路径）
    - 使用已安装到 `/usr/local/etc/xray/cert` 的证书（证书来源选 `3`）
 
@@ -190,13 +174,13 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 修改配置：
 
-- 所有模式均可在总菜单第 `12` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 / Snell 已安装时该菜单额外提供对应的节点名称修改项
+- 所有模式均可在总菜单第 `11` 项修改节点名称（仅影响分享链接备注）；AnyTLS / Hysteria 2 已安装时该菜单额外提供对应的节点名称修改项
 - Reality：同一菜单可更换 SNI 或重置 UUID
 - WS+TLS：域名变更需修改 `/usr/local/etc/xray/config.json` 后重启服务
 
 卸载指定节点：
 
-- 总菜单第 `14` 项，选择要卸载的节点后输入 `yes` 确认
+- 总菜单第 `13` 项，选择要卸载的节点后输入 `yes` 确认
 - 仅删除该节点的配置、元信息与对应服务，其他节点不受影响
 - 删除最后一个 Xray 节点时会停止并移除 `xray.service`，保留二进制、日志与配置文件
 - CF Tunnel 节点会额外确认是否删除 `cloudflared` / `cgg-quick-tunnel` 服务（保留 cloudflared 主程序）
@@ -204,9 +188,9 @@ NAT 机共享 IP，服务商分配受限端口范围，默认无 443/80，套 Cl
 
 彻底卸载：
 
-- 总菜单第 `15` 项，输入 `yes` 确认
-- 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS / Hysteria 2（sing-box）服务与配置目录、Snell 服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared / sing-box / snell-server 主程序删除时单独确认）
-- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 13 项 → 8
+- 总菜单第 `14` 项，输入 `yes` 确认
+- 会删除 Xray 核心、配置、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS / Hysteria 2（sing-box）服务与配置目录、`/opt/cgg-vless` 缓存（cloudflared 与 sing-box 主程序删除时单独确认）
+- **不会**删除 acme.sh 与已申请证书（`/root/.acme.sh`），如需清理用总菜单第 12 项 → 8
 - **不会**删除 UFW / iptables 放行规则，如需清理请手动执行：
 
 ```bash

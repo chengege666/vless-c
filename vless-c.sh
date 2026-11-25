@@ -3,8 +3,8 @@
 # cgg-vless · 总菜单入口
 # 适用系统：Ubuntu 20.04+ / Debian 11+
 # 用    法：sudo bash vless-c.sh
-# 说    明：统一入口，调用同目录下的七个子脚本（reality / ws-tls / tunnel /
-#           anytls / hysteria2 / xhttp / snell）；
+# 说    明：统一入口，调用同目录下的六个子脚本（reality / ws-tls / tunnel /
+#           anytls / hysteria2 / xhttp）；
 #           若通过 curl 远程运行，会自动下载子脚本到 /opt/cgg-vless 再执行
 # ==============================================================================
 set -Eeuo pipefail
@@ -41,13 +41,6 @@ readonly HS2_CONFIG="${SINGBOX_DIR}/hysteria2.json"
 readonly HS2_INFO="${SINGBOX_DIR}/cgg-hysteria2.info"
 readonly HS2_SERVICE_FILE="/etc/systemd/system/cgg-hysteria2.service"
 
-# Snell v6 使用官方闭源 snell-server，配置与服务独立存放
-readonly SNELL_BIN="/usr/local/bin/snell-server"
-readonly SNELL_DIR="/usr/local/etc/snell"
-readonly SNELL_CONFIG="${SNELL_DIR}/snell-server.conf"
-readonly SNELL_INFO="${SNELL_DIR}/cgg-snell.info"
-readonly SNELL_SERVICE_FILE="/etc/systemd/system/cgg-snell.service"
-
 # 子脚本文件名
 readonly SCRIPT_REALITY="cgg-vless-reality.sh"
 readonly SCRIPT_WS="cgg-vless-ws-tls.sh"
@@ -55,7 +48,6 @@ readonly SCRIPT_TUNNEL="cgg-vless-tunnel.sh"
 readonly SCRIPT_ANYTLS="cgg-vless-anytls.sh"
 readonly SCRIPT_HS2="cgg-vless-hysteria2.sh"
 readonly SCRIPT_XHTTP="cgg-vless-xhttp.sh"
-readonly SCRIPT_SNELL="cgg-vless-snell.sh"
 
 # ------------------------------ 颜色定义 --------------------------------------
 if [[ -t 1 ]]; then
@@ -602,11 +594,6 @@ install_hysteria2() {
     run_child "$SCRIPT_HS2"
 }
 
-# Snell v6 使用官方 snell-server 二进制，配置与服务均与其他节点分离
-install_snell() {
-    run_child "$SCRIPT_SNELL"
-}
-
 # XHTTP 与 WS+TLS 同属 Xray 实例，写入 config.json 前由子脚本做端口冲突检测
 install_xhttp() {
     if inbound_exists "$TAG_XHTTP"; then
@@ -692,25 +679,6 @@ update_hysteria2_info() {
         sed -i "s|^${key}=.*|${key}=${value}|" "$HS2_INFO"
     else
         printf '%s=%s\n' "$key" "$value" >> "$HS2_INFO"
-    fi
-}
-
-# Snell 元信息独立存放
-read_snell_info() {
-    local key="$1"
-    [[ -f "$SNELL_INFO" ]] || return 1
-    sed -n "s/^${key}=//p" "$SNELL_INFO" | head -n 1
-}
-
-update_snell_info() {
-    local key="$1" value="$2"
-    [[ -f "$SNELL_INFO" ]] || return 1
-    if grep -q "^${key}=" "$SNELL_INFO"; then
-        value="${value//|/\\|}"
-        value="${value//&/\\&}"
-        sed -i "s|^${key}=.*|${key}=${value}|" "$SNELL_INFO"
-    else
-        printf '%s=%s\n' "$key" "$value" >> "$SNELL_INFO"
     fi
 }
 
@@ -1082,61 +1050,6 @@ show_info_hysteria2() {
     printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$HS2_CONFIG" "$C_RESET"
 }
 
-show_info_snell() {
-    local port psk snell_mode node_name ip
-    if [[ ! -f "$SNELL_CONFIG" ]]; then
-        err "未找到 Snell 配置"
-        return 1
-    fi
-
-    port="$(read_snell_info PORT || true)"
-    if [[ -z "$port" ]]; then
-        port="$(sed -n 's/^listen *= *//p' "$SNELL_CONFIG" | head -n 1 | sed -E 's/.*:([0-9]+)$/\1/' || true)"
-    fi
-    psk="$(read_snell_info PSK || true)"
-    [[ -n "$psk" ]] || psk="$(sed -n 's/^psk *= *//p' "$SNELL_CONFIG" | head -n 1 || true)"
-    snell_mode="$(read_snell_info SNELL_MODE || true)"
-    [[ -n "$snell_mode" ]] || snell_mode="$(sed -n 's/^mode *= *//p' "$SNELL_CONFIG" | head -n 1 || true)"
-    node_name="$(read_snell_info NODE_NAME || true)"
-    [[ -n "$node_name" ]] || node_name="cgg-snell"
-
-    if [[ -z "$port" || -z "$psk" || -z "$snell_mode" ]]; then
-        err "Snell 配置读取不完整，无法生成客户端配置"
-        return 1
-    fi
-
-    ip="${SERVER_IP:-YOUR_SERVER_IP}"
-
-    printf '\n%s================ cgg-vless Snell v6 节点 ================%s\n' "$C_CYAN" "$C_RESET"
-    printf '  模式        : Snell v6（官方 snell-server）\n'
-    printf '  节点名称    : %s\n' "$node_name"
-    printf '  地址 (IP)   : %s\n' "$ip"
-    printf '  端口        : %s/TCP\n' "$port"
-    printf '  PSK         : %s\n' "$psk"
-    printf '  流量模式    : %s\n' "$snell_mode"
-    printf '%s=========================================================%s\n\n' "$C_CYAN" "$C_RESET"
-
-    printf '%sSurge：%s\n' "$C_GREEN" "$C_RESET"
-    printf '  %s = snell, %s, %s, psk=%s, version=6, mode=%s\n\n' \
-        "$node_name" "$ip" "$port" "$psk" "$snell_mode"
-    printf '%sStash / mihomo YAML：%s\n' "$C_GREEN" "$C_RESET"
-    printf '  - name: "%s"\n' "$node_name"
-    printf '    type: snell\n'
-    printf '    server: %s\n' "$ip"
-    printf '    port: %s\n' "$port"
-    printf '    psk: "%s"\n' "$psk"
-    printf '    version: 6\n'
-    printf '    mode: %s\n' "$snell_mode"
-    printf '    udp: true\n\n'
-
-    if systemctl is-active --quiet cgg-snell 2>/dev/null; then
-        log "Snell 服务状态：运行中"
-    else
-        warn "Snell 服务状态：未运行"
-    fi
-    printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$SNELL_CONFIG" "$C_RESET"
-}
-
 show_info() {
     if command -v jq >/dev/null 2>&1; then
         :
@@ -1218,13 +1131,6 @@ show_info() {
         fi
     fi
 
-    # Snell v6 使用独立 snell-server，与 Xray / sing-box 节点并存时一并显示
-    if [[ -f "$SNELL_CONFIG" ]]; then
-        if show_info_snell; then
-            shown=1
-        fi
-    fi
-
     if (( shown == 0 )); then
         err "未找到配置，请先执行安装"
         return 1
@@ -1234,13 +1140,12 @@ show_info() {
 # ------------------------------ 服务控制 --------------------------------------
 service_action() {
     local action="$1"
-    local has_xray=0 has_anytls=0 has_hs2=0 has_snell=0 failed=0
+    local has_xray=0 has_anytls=0 has_hs2=0 failed=0
     [[ -f "$SERVICE_FILE" ]] && has_xray=1
     [[ -f "$ANYTLS_SERVICE_FILE" ]] && has_anytls=1
     [[ -f "$HS2_SERVICE_FILE" ]] && has_hs2=1
-    [[ -f "$SNELL_SERVICE_FILE" ]] && has_snell=1
 
-    if (( has_xray == 0 && has_anytls == 0 && has_hs2 == 0 && has_snell == 0 )); then
+    if (( has_xray == 0 && has_anytls == 0 && has_hs2 == 0 )); then
         err "未找到 systemd 服务，请先执行安装"
         return 1
     fi
@@ -1257,11 +1162,6 @@ service_action() {
     # Hysteria 2 使用独立 sing-box 服务，与 Xray / AnyTLS 分别控制
     if (( has_hs2 == 1 )); then
         systemctl "$action" cgg-hysteria2 || { err "systemctl ${action} cgg-hysteria2 失败"; failed=1; }
-    fi
-
-    # Snell v6 使用独立 snell-server 服务
-    if (( has_snell == 1 )); then
-        systemctl "$action" cgg-snell || { err "systemctl ${action} cgg-snell 失败"; failed=1; }
     fi
 
     sleep 1
@@ -1290,7 +1190,6 @@ service_action() {
         (( has_xray == 1 )) && stopped="Xray"
         (( has_anytls == 1 )) && stopped="${stopped:+${stopped} / }AnyTLS"
         (( has_hs2 == 1 )) && stopped="${stopped:+${stopped} / }Hysteria 2"
-        (( has_snell == 1 )) && stopped="${stopped:+${stopped} / }Snell"
         log "${stopped} 已停止"
         return 0
     fi
@@ -1317,14 +1216,6 @@ service_action() {
             parts="${parts:+${parts}，}Hysteria 2 运行中"
         else
             err "Hysteria 2 ${action} 后未处于运行状态，请查看日志"
-            failed=1
-        fi
-    fi
-    if (( has_snell == 1 )); then
-        if systemctl is-active --quiet cgg-snell; then
-            parts="${parts:+${parts}，}Snell 运行中"
-        else
-            err "Snell ${action} 后未处于运行状态，请查看日志"
             failed=1
         fi
     fi
@@ -1625,38 +1516,16 @@ change_hysteria2_node_name() {
     show_info_hysteria2
 }
 
-# 修改 Snell 节点名称（仅影响客户端备注，无需重启服务）
-change_snell_node_name() {
-    local current input
-    current="$(read_snell_info NODE_NAME || true)"
-    [[ -n "$current" ]] || current="cgg-snell"
-
-    read -r -p "请输入新的 Snell 节点名称（当前 ${current}，回车取消）：" input
-    input="${input//[#?&%/]/}"
-    input="${input// /_}"
-    [[ -n "$input" ]] || { warn "输入为空，已取消"; return 1; }
-
-    if ! update_snell_info NODE_NAME "$input"; then
-        err "Snell 元信息文件不存在：${SNELL_INFO}"
-        return 1
-    fi
-    log "Snell 节点名称已更新为：${input}"
-
-    SERVER_IP="$(get_public_ip)"
-    show_info_snell
-}
-
 modify_menu() {
     local choice tags title t
     tags="$(xray_node_tags)"
 
-    local has_xray=0 has_anytls=0 has_hs2=0 has_snell=0
+    local has_xray=0 has_anytls=0 has_hs2=0
     [[ -n "$tags" ]] && has_xray=1
     [[ -f "$ANYTLS_CONFIG" ]] && has_anytls=1
     [[ -f "$HS2_CONFIG" ]] && has_hs2=1
-    [[ -f "$SNELL_CONFIG" ]] && has_snell=1
 
-    if (( has_xray == 0 && has_anytls == 0 && has_hs2 == 0 && has_snell == 0 )); then
+    if (( has_xray == 0 && has_anytls == 0 && has_hs2 == 0 )); then
         err "未找到有效配置，请先执行安装"
         return 1
     fi
@@ -1675,9 +1544,6 @@ modify_menu() {
         if (( has_hs2 == 1 )); then
             title="${title:+${title} + }hysteria2"
         fi
-        if (( has_snell == 1 )); then
-            title="${title:+${title} + }snell"
-        fi
         printf '\n%s-------- 修改配置（当前节点：%s）--------%s\n' "$C_CYAN" "$title" "$C_RESET"
         if (( has_xray == 1 )); then
             printf '  1) 修改节点名称\n'
@@ -1691,9 +1557,6 @@ modify_menu() {
         fi
         if (( has_hs2 == 1 )); then
             printf '  5) 修改 Hysteria 2 节点名称\n'
-        fi
-        if (( has_snell == 1 )); then
-            printf '  6) 修改 Snell 节点名称\n'
         fi
         printf '  0) 返回主菜单\n'
         if ! read -r -p "请选择：" choice; then
@@ -1732,13 +1595,6 @@ modify_menu() {
             5)
                 if (( has_hs2 == 1 )); then
                     change_hysteria2_node_name || true
-                else
-                    warn "无效选项：${choice}"
-                fi
-                ;;
-            6)
-                if (( has_snell == 1 )); then
-                    change_snell_node_name || true
                 else
                     warn "无效选项：${choice}"
                 fi
@@ -2078,9 +1934,6 @@ uninstall_node_choices() {
     if [[ -f "$HS2_CONFIG" ]]; then
         printf 'hysteria2|hysteria2|Hysteria 2\n'
     fi
-    if [[ -f "$SNELL_CONFIG" ]]; then
-        printf 'snell|snell|Snell v6\n'
-    fi
 }
 
 # 删除 CF Tunnel 相关服务（固定与临时一并清理，保留 cloudflared 主程序）
@@ -2259,33 +2112,6 @@ remove_hysteria2_node() {
     warn "防火墙放行规则未自动删除，如有需要请手动清理"
 }
 
-# 卸载 Snell v6 节点（官方 snell-server 后端），保留 snell-server 主程序
-remove_snell_node() {
-    local ans
-    if [[ ! -f "$SNELL_CONFIG" ]]; then
-        err "未找到 Snell 配置"
-        return 1
-    fi
-
-    read -r -p "确认卸载 Snell 节点？该操作不可恢复 [yes/N]：" ans
-    if [[ "$ans" != "yes" ]]; then
-        warn "已取消"
-        return 1
-    fi
-
-    systemctl stop cgg-snell >/dev/null 2>&1 || true
-    systemctl disable cgg-snell >/dev/null 2>&1 || true
-    rm -f "$SNELL_SERVICE_FILE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl reset-failed >/dev/null 2>&1 || true
-
-    rm -f "$SNELL_CONFIG" "$SNELL_INFO"
-    # 配置备份中含明文 PSK，节点卸载后一并清理
-    rm -f "${SNELL_CONFIG}".bak.*
-    log "Snell 节点已卸载（snell-server 主程序保留）"
-    warn "防火墙放行规则未自动删除，如有需要请手动清理"
-}
-
 # 选择并卸载指定节点
 uninstall_node_menu() {
     local choices=() line kind tag desc choice sel i=1
@@ -2325,7 +2151,6 @@ uninstall_node_menu() {
         xray)      remove_xray_node "$tag" || true ;;
         anytls)    remove_anytls_node || true ;;
         hysteria2) remove_hysteria2_node || true ;;
-        snell)     remove_snell_node || true ;;
         *)         warn "未知节点类型：${kind}" ;;
     esac
 }
@@ -2333,7 +2158,7 @@ uninstall_node_menu() {
 # ------------------------------ 彻底卸载 --------------------------------------
 uninstall_all() {
     local ans
-    warn "即将删除：Xray 核心、配置文件、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS 服务、Hysteria 2 服务、Snell 服务"
+    warn "即将删除：Xray 核心、配置文件、日志、systemd 服务、Cloudflare Tunnel 服务、AnyTLS 服务、Hysteria 2 服务"
     read -r -p "确认彻底卸载？该操作不可恢复 [yes/N]：" ans
     if [[ "$ans" != "yes" ]]; then
         warn "已取消"
@@ -2387,28 +2212,6 @@ uninstall_all() {
         systemctl daemon-reload
         log "已删除 Hysteria 2 服务"
     fi
-
-    # 清理 Snell v6（官方 snell-server 后端）
-    if [[ -f "$SNELL_SERVICE_FILE" ]] || systemctl cat cgg-snell >/dev/null 2>&1; then
-        systemctl stop cgg-snell >/dev/null 2>&1 || true
-        systemctl disable cgg-snell >/dev/null 2>&1 || true
-        rm -f "$SNELL_SERVICE_FILE"
-        systemctl daemon-reload
-        log "已删除 Snell 服务"
-    fi
-    if [[ -d "$SNELL_DIR" ]]; then
-        rm -rf "$SNELL_DIR"
-        log "已删除 Snell 配置目录：${SNELL_DIR}"
-    fi
-    if [[ -x "$SNELL_BIN" ]]; then
-        local lans
-        read -r -p "是否同时删除 snell-server 主程序？[y/N]：" lans
-        case "$lans" in
-            [Yy]*) rm -f "$SNELL_BIN"; log "已删除 snell-server 主程序" ;;
-            *) warn "已保留 snell-server 主程序" ;;
-        esac
-    fi
-
     if [[ -d "$SINGBOX_DIR" ]]; then
         rm -rf "$SINGBOX_DIR"
         log "已删除 sing-box 配置目录：${SINGBOX_DIR}"
@@ -2474,14 +2277,6 @@ collect_script_ports() {
                 [[ -n "$item" ]] || continue
                 printf 'udp|%s|Hysteria 2 端口跳跃|hop|cgg-hysteria2-hop\n' "$item"
             done
-        fi
-    fi
-
-    if [[ -f "$SNELL_CONFIG" ]]; then
-        port="$(read_snell_info PORT 2>/dev/null || true)"
-        [[ -n "$port" ]] || port="$(sed -n 's/^listen *= *//p' "$SNELL_CONFIG" | head -n 1 | sed -E 's/.*:([0-9]+)$/\1/' || true)"
-        if [[ -n "$port" ]]; then
-            printf 'tcp|%s|Snell v6|main|cgg-snell\n' "$port"
         fi
     fi
 }
@@ -3058,7 +2853,7 @@ enable_bbr() {
         fi
         if [[ " $available " != *" bbr "* ]]; then
             err "当前内核不支持 BBR（LXC / OpenVZ 容器常见，由宿主内核决定）"
-            warn "仍可使用菜单 16 的 TCP 窗口调优"
+            warn "仍可使用菜单 15 的 TCP 窗口调优"
             return 1
         fi
     fi
@@ -3119,10 +2914,6 @@ show_menu() {
     if [[ -f "$HS2_CONFIG" ]]; then
         mode_desc="${mode_desc}${C_CYAN} + Hysteria2${C_RESET}"
     fi
-    # Snell v6 使用官方 snell-server 后端
-    if [[ -f "$SNELL_CONFIG" ]]; then
-        mode_desc="${mode_desc}${C_CYAN} + Snell${C_RESET}"
-    fi
 
     printf '%s==================== cgg-vless 总菜单 ====================%s\n' "$C_MAGENTA" "$C_RESET"
     printf '  当前节点：%b\n' "$mode_desc"
@@ -3132,20 +2923,19 @@ show_menu() {
     printf '  %-2s %s\n' "4"  "安装 AnyTLS + TLS 节点（sing-box 后端）"
     printf '  %-2s %s\n' "5"  "安装 Hysteria 2 节点（sing-box 后端）"
     printf '  %-2s %s\n' "6"  "安装 VLESS + XHTTP 节点（直连/CDN 或 CF Tunnel）"
-    printf '  %-2s %s\n' "7"  "安装 Snell v6 节点（官方 snell-server）"
     printf '  ----------------------------------------------------------\n'
-    printf '  %-2s %s\n' "8"  "查看当前节点配置与连接链接"
-    printf '  %-2s %s\n' "9"  "启动 Xray 服务"
-    printf '  %-2s %s\n' "10" "停止 Xray 服务"
-    printf '  %-2s %s\n' "11" "重启 Xray 服务"
-    printf '  %-2s %s\n' "12" "修改配置"
-    printf '  %-2s %s\n' "13" "SSL 证书管理"
-    printf '  %-2s %s\n' "14" "卸载指定节点"
-    printf '  %-2s %s\n' "15" "一键彻底卸载"
-    printf '  %-2s %s\n' "16" "TCP 窗口调优"
-    printf '  %-2s %s\n' "17" "开启 BBR 加速"
-    printf '  %-2s %s\n' "18" "端口释放"
-    printf '  %-2s %s\n' "19" "核心更新"
+    printf '  %-2s %s\n' "7"  "查看当前节点配置与连接链接"
+    printf '  %-2s %s\n' "8"  "启动 Xray 服务"
+    printf '  %-2s %s\n' "9"  "停止 Xray 服务"
+    printf '  %-2s %s\n' "10" "重启 Xray 服务"
+    printf '  %-2s %s\n' "11" "修改配置"
+    printf '  %-2s %s\n' "12" "SSL 证书管理"
+    printf '  %-2s %s\n' "13" "卸载指定节点"
+    printf '  %-2s %s\n' "14" "一键彻底卸载"
+    printf '  %-2s %s\n' "15" "TCP 窗口调优"
+    printf '  %-2s %s\n' "16" "开启 BBR 加速"
+    printf '  %-2s %s\n' "17" "端口释放"
+    printf '  %-2s %s\n' "18" "核心更新"
     printf '  %-2s %s\n' "0"  "退出"
     printf '%s==========================================================%s\n' "$C_MAGENTA" "$C_RESET"
 }
@@ -3163,7 +2953,7 @@ main_menu() {
     local choice
     while true; do
         show_menu
-        if ! read -r -p "请选择 [0-19]：" choice; then
+        if ! read -r -p "请选择 [0-18]：" choice; then
             printf '\n'
             return 0
         fi
@@ -3174,19 +2964,18 @@ main_menu() {
             4) install_anytls || true ;;
             5) install_hysteria2 || true ;;
             6) install_xhttp || true ;;
-            7) install_snell || true ;;
-            8) show_info || true ;;
-            9) service_action start || true ;;
-            10) service_action stop || true ;;
-            11) service_action restart || true ;;
-            12) modify_menu || true ;;
-            13) cert_menu ;;
-            14) uninstall_node_menu || true ;;
-            15) uninstall_all || true ;;
-            16) enable_tcp_tune || true ;;
-            17) enable_bbr || true ;;
-            18) release_ports || true ;;
-            19) core_update_menu || true ;;
+            7) show_info || true ;;
+            8) service_action start || true ;;
+            9) service_action stop || true ;;
+            10) service_action restart || true ;;
+            11) modify_menu || true ;;
+            12) cert_menu ;;
+            13) uninstall_node_menu || true ;;
+            14) uninstall_all || true ;;
+            15) enable_tcp_tune || true ;;
+            16) enable_bbr || true ;;
+            17) release_ports || true ;;
+            18) core_update_menu || true ;;
             0) log "已退出"; return 0 ;;
             *) warn "无效选项：${choice}" ;;
         esac

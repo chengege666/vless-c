@@ -466,7 +466,7 @@ ask_listen_port() {
                 printf '  3) 监听端口 %s 不在 Cloudflare 支持列表，需在 Cloudflare Origin Rules\n' "$LISTEN_PORT"
                 printf '     将回源端口设为 %s，客户端端口填 443\n' "$LISTEN_PORT"
             fi
-            printf '  4) 80 端口不可用申请证书时，改用 DNS-01 验证（总菜单 13 → 3）\n'
+            printf '  4) 80 端口不可用申请证书时，改用 DNS-01 验证（总菜单 12 → 3）\n'
             printf '%s----------------------------------------%s\n' "$C_YELLOW" "$C_RESET"
             ;;
         *)
@@ -769,7 +769,7 @@ issue_cert() {
             err "DNS 查询失败（NXDOMAIN）：域名未解析或记录尚未生效"
         elif grep -qE 'Connection refused|Timeout|timed out' "$log_file" 2>/dev/null; then
             err "80 端口公网不可达：请检查安全组、NAT 端口映射与防火墙"
-            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 13 → 3）"
+            err "如无法开放 80 端口，请改用 DNS-01 验证（总菜单 12 → 3）"
         elif grep -q 'Invalid response' "$log_file" 2>/dev/null; then
             err "80 端口被其他服务占用或响应异常"
         fi
@@ -863,7 +863,7 @@ use_cert_files() {
 use_installed_cert() {
     local cert="${CERT_DIR}/fullchain.pem" key="${CERT_DIR}/privkey.pem"
     [[ -s "$cert" && -s "$key" ]] \
-        || die "未找到已安装证书，请先在总菜单 13 中申请并安装到 ${CERT_DIR}"
+        || die "未找到已安装证书，请先在总菜单 12 中申请并安装到 ${CERT_DIR}"
     cert_is_valid "$cert" "$key" || die "已安装的证书与私钥不匹配，请重新安装证书"
     fix_cert_perms
     log "使用已安装证书：${CERT_DIR}"
@@ -1160,7 +1160,7 @@ merge_config() {
         err "配置校验输出："
         cat "$test_log" >&2 || true
         rm -f "$test_log" "$tmp_cfg"
-        die "Xray 配置校验失败，未启动服务（若提示不支持 xhttp，请先在总菜单 19 执行核心更新）"
+        die "Xray 配置校验失败，未启动服务（若提示不支持 xhttp，请先在总菜单 18 执行核心更新）"
     fi
     rm -f "$test_log"
 
@@ -1465,7 +1465,7 @@ print_result() {
     # 隧道模式：地址为隧道域名，端口固定 443，TLS 由 Cloudflare 边缘处理
     if [[ "$DEPLOY_MODE" == "tunnel" ]]; then
         if [[ -z "$TUNNEL_DOMAIN" ]]; then
-            warn "尚未记录隧道域名，链接中域名为占位符，配置好后请在总菜单 8 中重新查看"
+            warn "尚未记录隧道域名，链接中域名为占位符，配置好后请在总菜单 7 中重新查看"
             TUNNEL_DOMAIN="YOUR_TUNNEL_DOMAIN"
         fi
         enc_path="$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')"
@@ -1494,7 +1494,7 @@ print_result() {
         printf '%s============================================================%s\n\n' "$C_CYAN" "$C_RESET"
 
         if [[ "$TUNNEL_TYPE" == "quick" ]]; then
-            printf '%s临时隧道：域名每次重启都会变化，总菜单 8 重新查看可获取最新域名；仅建议测试使用。%s\n' "$C_YELLOW" "$C_RESET"
+            printf '%s临时隧道：域名每次重启都会变化，总菜单 7 重新查看可获取最新域名；仅建议测试使用。%s\n' "$C_YELLOW" "$C_RESET"
         else
             printf '%s固定隧道：如尚未在网页端配置，请按上方提示添加 Public Hostname（Type: HTTP → URL: http://localhost:%s，需带 http:// 协议头）。%s\n' "$C_YELLOW" "$LOCAL_PORT" "$C_RESET"
         fi
