@@ -354,14 +354,11 @@ gen_psk() {
 
 # ------------------------------ 安装 snell-server -----------------------------
 install_snell() {
-    local cur_ver=""
-    if [[ -x "$SNELL_BIN" ]]; then
-        cur_ver="$("$SNELL_BIN" --version 2>/dev/null | head -n 1 | awk '{print $2}' | sed 's/^v//' || true)"
-        if [[ "$cur_ver" == "$SNELL_VERSION" ]]; then
-            log "检测到已安装的 snell-server v${cur_ver}，直接复用：${SNELL_BIN}"
-            return 0
-        fi
-        [[ -n "$cur_ver" ]] && warn "现有 snell-server 版本为 v${cur_ver}，将替换为 v${SNELL_VERSION}"
+    # 官方二进制的 --version 输出格式/输出通道不稳定，这里只校验可执行性，
+    # 版本以安装包 URL 为准，避免误判导致安装中断
+    if [[ -x "$SNELL_BIN" ]] && "$SNELL_BIN" --help >/dev/null 2>&1; then
+        log "检测到可用的 snell-server，直接复用：${SNELL_BIN}"
+        return 0
     fi
 
     local arch url tmpdir zipfile new_bin
@@ -409,10 +406,7 @@ install_snell() {
     rm -rf "$tmpdir"
 
     "$SNELL_BIN" --help >/dev/null 2>&1 || die "snell-server 安装后无法运行"
-    cur_ver="$("$SNELL_BIN" --version 2>/dev/null | head -n 1 | awk '{print $2}' | sed 's/^v//' || true)"
-    [[ "$cur_ver" == "$SNELL_VERSION" ]] \
-        || die "安装的 snell-server 版本为 v${cur_ver:-unknown}，与预期 v${SNELL_VERSION} 不一致"
-    log "snell-server 安装完成：${SNELL_BIN} (v${cur_ver})"
+    log "snell-server 安装完成：${SNELL_BIN}（安装包 v${SNELL_VERSION}）"
 }
 
 # ------------------------------ 配置写入 --------------------------------------
@@ -433,13 +427,13 @@ write_config() {
         listen_value="0.0.0.0:${PORT}"
     fi
 
-    # v6 服务端配置文件不再需要 version 项，mode 决定混淆与加密策略
+    # v6 服务端配置文件不再需要 version 项，mode 决定混淆与加密策略；
+    # dns-ip-preference 保持缺省，避免不同小版本对默认值兼容性不一致
     cat > "$CONFIG_FILE" <<EOF
 [snell-server]
 listen = ${listen_value}
 psk = ${PSK}
 mode = ${SNELL_MODE}
-dns-ip-preference = default
 EOF
 
     # snell-server 以 nobody 运行，配置含 PSK，需属组可读且限制其他用户
