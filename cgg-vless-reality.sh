@@ -51,6 +51,8 @@ SHORT_ID=""
 SERVER_IP=""
 RUN_USER="nobody"
 RUN_GROUP="nogroup"
+ACTION="install"
+LISTEN_MODE=""
 
 # ------------------------------ 日志函数 --------------------------------------
 log()  { printf '%s[INFO]%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
@@ -148,21 +150,126 @@ check_memory_headroom() {
 
 # ------------------------------ 监听地址 --------------------------------------
 # 0.0.0.0 只创建 IPv4 socket，IPv6 客户端连不进来；:: 在 bindv6only=0 时是双栈。
-# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4，
-# 所以不写死，按内核实际能力探测。
-detect_listen_addr() {
+# 但内核禁用 IPv6 时绑 :: 会直接失败，bindv6only=1 时绑 :: 会丢掉 IPv4。
+# 所以探测结果只当默认值，最终用哪种接入模式由用户选择（--listen=auto|v4|dual|v6）。
+LISTEN_ADDR=""
+
+kernel_dual_ok() {
     local dis b6
     dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
     b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)"
-    if [[ "$dis" == "0" && "$b6" == "0" ]]; then
+    [[ "$dis" == "0" && "$b6" == "0" ]]
+}
+
+detect_listen_addr() {
+    if kernel_dual_ok; then
         printf '::'
     else
         printf '0.0.0.0'
     fi
 }
 
-LISTEN_ADDR="$(detect_listen_addr 2>/dev/null || true)"
-[[ -n "$LISTEN_ADDR" ]] || LISTEN_ADDR="0.0.0.0"
+# 公网 IPv6 地址：仅「仅 IPv6」模式需要，取不到返回空串
+public_v6() {
+    local ip=""
+    if command -v curl >/dev/null 2>&1; then
+        ip="$(curl -fsS6 --max-time 5 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
+        [[ -n "$ip" ]] || ip="$(curl -fsS6 --max-time 5 https://api6.ipify.org 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
+        ip="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ {print $2}' \
+            | cut -d/ -f1 | grep -vE '^(fe80|fc|fd)' | head -n 1 || true)"
+    fi
+    [[ "$ip" == *:* ]] || ip=""
+    printf '%s' "$ip"
+}
+
+listen_mode_label() {
+    case "$1" in
+        v4)   printf '仅 IPv4' ;;
+        dual) printf '双栈（v4 + v6）' ;;
+        v6)   printf '仅 IPv6' ;;
+        *)    printf '自动探测' ;;
+    esac
+}
+
+# 按实际绑定地址回显，避免 auto 模式下显示成「自动探测」看不出结果
+listen_addr_label() {
+    case "$1" in
+        '::')    printf '双栈（v4 + v6）' ;;
+        '0.0.0.0') printf '仅 IPv4' ;;
+        *)       printf '仅 IPv6' ;;
+    esac
+}
+
+# 把接入模式落到实际监听地址；条件不满足时明确告警并回退，不让安装卡在可选优化上
+apply_listen_mode() {
+    local mode="$1" addr="" dis b6
+    case "$mode" in
+        v4)   addr='0.0.0.0' ;;
+        dual) addr='::' ;;
+        v6)   addr="$(public_v6)" ;;
+        *)    mode='auto'; addr="$(detect_listen_addr)" ;;
+    esac
+
+    if [[ "$mode" == "dual" ]] && ! kernel_dual_ok; then
+        dis="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo '?')"
+        b6="$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo '?')"
+        warn "内核不满足双栈条件：disable_ipv6=${dis} bindv6only=${b6}"
+        warn "此时绑 :: 可能直接启动失败，或只留 IPv6 丢掉 IPv4，已回退为仅 IPv4"
+        warn "确实要双栈请先执行：sysctl -w net.ipv6.bindv6only=0（并确认 disable_ipv6=0）"
+        mode='v4'; addr='0.0.0.0'
+    fi
+
+    if [[ "$mode" == "v6" && -z "$addr" ]]; then
+        warn "未取到公网 IPv6 地址，已回退为仅 IPv4"
+        mode='v4'; addr='0.0.0.0'
+    fi
+
+    LISTEN_MODE="$mode"
+    LISTEN_ADDR="$addr"
+    log "接入模式：$(listen_mode_label "$mode")（listen=${LISTEN_ADDR}）"
+}
+
+ask_listen_mode() {
+    local detected def choice
+    detected="$(detect_listen_addr)"
+
+    # 命令行 --listen= 已显式指定时不再询问
+    if [[ -n "$LISTEN_MODE" && "$LISTEN_MODE" != "auto" ]]; then
+        log "接入模式由命令行指定：$(listen_mode_label "$LISTEN_MODE")"
+        apply_listen_mode "$LISTEN_MODE"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        apply_listen_mode 'auto'
+        log "非交互模式：按内核探测结果选择接入模式"
+        return 0
+    fi
+
+    if [[ "$detected" == "::" ]]; then def=2; else def=1; fi
+    printf '\n选择接入模式（决定哪些客户端能连进来）：\n'
+    printf '  1) 仅 IPv4   绑 0.0.0.0，v6 客户端连不进来，兼容性最好\n'
+    printf '  2) 双栈      绑 ::，v4 与 v6 都能进，需内核支持\n'
+    printf '  3) 仅 IPv6   只绑公网 v6 地址，v4 客户端连不进来\n'
+    if [[ "$detected" == "::" ]]; then
+        printf '  内核探测：双栈可用\n'
+    else
+        printf '  内核探测：仅 IPv4 可用（disable_ipv6 或 bindv6only 非 0）\n'
+    fi
+    read -r -p "请选择 [1-3]（回车默认 ${def}）：" choice || true
+
+    case "${choice:-$def}" in
+        1) apply_listen_mode 'v4' ;;
+        3) apply_listen_mode 'v6' ;;
+        *) apply_listen_mode 'dual' ;;
+    esac
+
+    if [[ "$LISTEN_MODE" == "v6" ]]; then
+        warn "仅 IPv6 绑定的是具体地址 ${LISTEN_ADDR}，该地址变化后需重新切换"
+    fi
+}
 
 # IPv6 地址在 URI 里必须加方括号，否则 @ 后面的冒号会被当成端口分隔符
 format_host() {
@@ -657,6 +764,8 @@ save_info() {
         printf 'PUBLIC_KEY=%s\n' "$PUBLIC_KEY"
         printf 'SHORT_ID=%s\n' "$SHORT_ID"
         printf 'NODE_NAME=%s\n' "$NODE_NAME"
+        printf 'LISTEN_MODE=%s\n' "${LISTEN_MODE:-auto}"
+        printf 'LISTEN_ADDR=%s\n' "${LISTEN_ADDR:-0.0.0.0}"
     } > "$NODE_INFO"
     chmod 600 "$NODE_INFO"
 
@@ -820,8 +929,15 @@ get_public_ip() {
 
 # ------------------------------ 结果输出 --------------------------------------
 print_result() {
-    local link
+    local link v6_hint=""
     local ip="${SERVER_IP:-YOUR_SERVER_IP}"
+
+    # 仅 IPv6 模式下链接必须填 v6 地址；双栈模式额外提示一条 v6 接入地址
+    if [[ "$LISTEN_ADDR" == *:* && "$LISTEN_ADDR" != "::" ]]; then
+        ip="$LISTEN_ADDR"
+    elif [[ "$LISTEN_ADDR" == "::" ]]; then
+        v6_hint="$(public_v6)"
+    fi
 
     if command -v jq >/dev/null 2>&1 && [[ -f "$CONFIG_FILE" ]]; then
         if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -835,6 +951,7 @@ print_result() {
     printf '  节点名称    : %s\n' "$NODE_NAME"
     printf '  地址 (IP)   : %s\n' "$ip"
     printf '  端口        : %s\n' "$PORT"
+    printf '  接入模式    : %s（listen=%s）\n' "$(listen_addr_label "$LISTEN_ADDR")" "$LISTEN_ADDR"
     printf '  UUID        : %s\n' "$UUID"
     printf '  流控 flow   : xtls-rprx-vision\n'
     printf '  公钥 pbk    : %s\n' "$PUBLIC_KEY"
@@ -847,12 +964,147 @@ print_result() {
 
     printf '%sVLESS 分享链接：%s\n%s\n\n' "$C_GREEN" "$C_RESET" "$link"
 
+    if [[ -n "$v6_hint" ]]; then
+        printf '%sIPv6 同节点可用地址：%s:%s（把链接里的地址换成它即可，端口与参数不变）%s\n\n' \
+            "$C_CYAN" "$(format_host "$v6_hint")" "$PORT" "$C_RESET"
+    fi
+
     printf '%s服务管理：systemctl {status|restart|stop} xray%s\n' "$C_CYAN" "$C_RESET"
     printf '%s配置文件：%s%s\n\n' "$C_CYAN" "$CONFIG_FILE" "$C_RESET"
 }
 
+# ------------------------------ 切换接入模式 ----------------------------------
+# 只改已有节点的 listen，不动 UUID / 端口 / SNI / 密钥，客户端无需重新导入
+verify_listen_addr() {
+    local expect="$1" port="$2" got=""
+    command -v ss >/dev/null 2>&1 || return 0
+    got="$(ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}$" | head -n 1 || true)"
+    if [[ -z "$got" ]]; then
+        warn "未在 ss 中看到端口 ${port} 的监听，请检查 systemctl status xray"
+        return 1
+    fi
+    log "实际监听：${got}"
+    if [[ "$expect" == "::" ]]; then
+        [[ "$got" == "*:${port}" || "$got" == "[::]:${port}" ]] \
+            || warn "预期双栈 [::]:${port}，实际 ${got}，可能仍只监听 IPv4"
+    elif [[ "$got" != *"${expect}:"* ]]; then
+        warn "预期 ${expect}:${port}，实际 ${got}"
+    fi
+    return 0
+}
+
+switch_listen_mode() {
+    require_root
+    command -v jq >/dev/null 2>&1 || die "缺少 jq，请先安装：apt-get install -y jq"
+    [[ -x "$XRAY_BIN" ]] || die "未找到 ${XRAY_BIN}，请先安装 VLESS-Reality 节点"
+    [[ -f "$CONFIG_FILE" ]] || die "未找到 ${CONFIG_FILE}，请先安装 VLESS-Reality 节点"
+
+    local cur_port cur_addr backup tmp_cfg test_out
+    cur_port="$(jq -r --arg t "$NODE_TAG" '[.inbounds[]? | select(.tag == $t)][0].port // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$cur_port" ]] || die "配置中没有 ${NODE_TAG} 节点，请先安装"
+    cur_addr="$(jq -r --arg t "$NODE_TAG" '[.inbounds[]? | select(.tag == $t)][0].listen // "0.0.0.0"' "$CONFIG_FILE" 2>/dev/null || true)"
+    PORT="$cur_port"
+
+    show_banner
+    printf '当前接入：listen=%s  端口=%s\n' "$cur_addr" "$PORT"
+
+    ask_listen_mode
+    if [[ "$LISTEN_ADDR" == "$cur_addr" ]]; then
+        log "接入模式未变化，未做任何修改"
+        return 0
+    fi
+
+    backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$CONFIG_FILE" "$backup" || die "备份配置失败：${CONFIG_FILE}"
+    log "原配置已备份：${backup}"
+
+    # Xray 按扩展名判断配置格式，临时文件必须带 .json 后缀
+    tmp_cfg="$(mktemp "${TMPDIR:-/tmp}/cgg-listen-XXXXXX.json")"
+    if ! jq --arg t "$NODE_TAG" --arg a "$LISTEN_ADDR" \
+        '(.inbounds[] | select(.tag == $t) | .listen) = $a' \
+        "$CONFIG_FILE" > "$tmp_cfg"; then
+        rm -f "$tmp_cfg"
+        die "改写 listen 失败，配置未改动"
+    fi
+
+    test_out="$(mktemp)"
+    if ! "$XRAY_BIN" run -test -config "$tmp_cfg" >"$test_out" 2>&1; then
+        err "配置校验输出："
+        cat "$test_out" >&2 || true
+        rm -f "$test_out" "$tmp_cfg"
+        die "Xray 配置校验失败，未应用改动"
+    fi
+    rm -f "$test_out"
+
+    if ! install -m 640 "$tmp_cfg" "$CONFIG_FILE"; then
+        rm -f "$tmp_cfg"
+        die "写入配置失败：${CONFIG_FILE}"
+    fi
+    rm -f "$tmp_cfg"
+    chown root:"$RUN_GROUP" "$CONFIG_FILE" 2>/dev/null || true
+
+    systemctl restart xray || true
+    sleep 1
+    systemctl is-active --quiet xray \
+        || die "Xray 重启失败，请用 journalctl -u xray -n 30 查看；配置备份：${backup}"
+
+    # 端口没变，但切换族后 v6 放行规则可能缺失，这里补齐（只加不删）
+    configure_firewall
+    verify_listen_addr "$LISTEN_ADDR" "$PORT" || true
+
+    if [[ -f "$NODE_INFO" ]]; then
+        local tmp_info="${NODE_INFO}.tmp"
+        if grep -vE '^(LISTEN_MODE|LISTEN_ADDR)=' "$NODE_INFO" > "$tmp_info" 2>/dev/null; then
+            printf 'LISTEN_MODE=%s\nLISTEN_ADDR=%s\n' "$LISTEN_MODE" "$LISTEN_ADDR" >> "$tmp_info" \
+                && mv -f "$tmp_info" "$NODE_INFO" || rm -f "$tmp_info"
+        else
+            rm -f "$tmp_info"
+        fi
+        chmod 600 "$NODE_INFO" 2>/dev/null || true
+    fi
+
+    printf '\n%s接入模式已切换：%s（listen=%s）%s\n' \
+        "$C_GREEN" "$(listen_addr_label "$LISTEN_ADDR")" "$LISTEN_ADDR" "$C_RESET"
+    printf 'UUID / 端口 / SNI / 密钥均未改动，客户端无需重新导入。\n\n'
+}
+
+# ------------------------------ 参数解析 --------------------------------------
+usage() {
+    cat <<'EOF'
+用法：sudo bash cgg-vless-reality.sh [选项]
+
+  （无参数）            安装或重建 VLESS-Reality 节点
+  --listen=MODE         指定接入模式：auto（按内核探测）| v4 | dual | v6
+  --switch-listen       只切换已有节点的接入模式，不重装、不改密钥
+  -h, --help            显示本帮助
+EOF
+}
+
+parse_args() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --listen=*) LISTEN_MODE="${arg#*=}" ;;
+            --switch-listen) ACTION="switch" ;;
+            -h|--help) usage; exit 0 ;;
+            *) warn "忽略未知参数：${arg}" ;;
+        esac
+    done
+    case "$LISTEN_MODE" in
+        ""|auto|v4|dual|v6) ;;
+        *) die "--listen 只接受 auto / v4 / dual / v6，当前：${LISTEN_MODE}" ;;
+    esac
+}
+
 # ------------------------------ 主流程 ----------------------------------------
 main() {
+    parse_args "$@"
+
+    if [[ "$ACTION" == "switch" ]]; then
+        switch_listen_mode
+        return 0
+    fi
+
     require_root
     show_banner
     check_os
@@ -864,6 +1116,7 @@ main() {
     ask_port
     ask_sni
     ask_node_name
+    ask_listen_mode
 
     install_deps
     check_network
